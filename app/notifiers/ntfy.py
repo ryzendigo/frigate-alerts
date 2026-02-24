@@ -1,4 +1,4 @@
-"""Ntfy notification provider — sends with image attachment."""
+"""Ntfy notification provider. Sends with image attachment."""
 
 import logging
 import requests

@@ -21,7 +21,6 @@ h1{font-size:1.4rem;font-weight:600}h1 span{color:var(--ac)}
 .card{background:var(--s1);border:1px solid var(--bd);border-radius:var(--rd);padding:14px;margin-bottom:10px}
 .card h3{font-size:.92rem;margin-bottom:10px;display:flex;align-items:center;justify-content:space-between}
 .g2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
-.g3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px}
 .fg{margin-bottom:10px}.fg label{display:block;font-size:.75rem;color:var(--td);margin-bottom:3px;text-transform:uppercase;letter-spacing:.5px}
 input,select,textarea{width:100%;padding:7px 10px;background:var(--s2);border:1px solid var(--bd);border-radius:var(--rd);color:var(--t);font-size:.88rem}
 input:focus,textarea:focus{outline:none;border-color:var(--ac)}
@@ -48,7 +47,7 @@ td{padding:7px;border-bottom:1px solid var(--bd)}
 .toast{position:fixed;bottom:20px;right:20px;padding:10px 18px;border-radius:var(--rd);font-size:.83rem;z-index:999;animation:fi .2s}
 .tok{background:#052e16;border:1px solid #166534;color:var(--g)}.ter{background:#2d0a0a;border:1px solid #991b1b;color:var(--r)}
 @keyframes fi{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
-@media(max-width:640px){.g2,.g3{grid-template-columns:1fr}.sr{flex-direction:column}}
+@media(max-width:640px){.g2{grid-template-columns:1fr}.sr{flex-direction:column}}
 .prov-body{margin-top:10px}
 .hint{font-size:.75rem;color:var(--td);margin-top:4px}
 .opt-tag{font-size:.65rem;padding:1px 6px;border-radius:8px;background:var(--s2);border:1px solid var(--bd);color:var(--td);margin-left:6px;text-transform:uppercase}
@@ -61,13 +60,11 @@ td{padding:7px;border-bottom:1px solid var(--bd)}
 <h1>Frigate <span>Alerts</span></h1>
 <p class="sub">Animated GIF notifications from Frigate NVR</p>
 
-<!-- Snooze banner -->
 <div class="snooze-bar" id="snzBar" style="display:none">
-<span>Notifications snoozed — <span class="time" id="snzTime">0:00</span> remaining</span>
-<button class="btn bsm bs" onclick="unsnooze()">Cancel Snooze</button>
+<span>Notifications snoozed - <span class="time" id="snzTime">0:00</span> remaining</span>
+<button class="btn bsm bs" onclick="unsnooze()">Cancel</button>
 </div>
 
-<!-- Status badges -->
 <div class="sr" id="st">
 <div class="sb"><div class="dot" id="fd"></div>Frigate <span id="fs">...</span></div>
 <div class="sb"><div class="dot" id="pd"></div>Poller <span id="ps">...</span></div>
@@ -81,17 +78,42 @@ td{padding:7px;border-bottom:1px solid var(--bd)}
 </div>
 
 <div class="pnl on" id="cfg">
+
 <!-- Frigate -->
-<div class="card"><h3>Frigate</h3><div class="g2">
+<div class="card"><h3>Frigate</h3>
+<div class="g2">
 <div class="fg"><label>Internal URL</label><input id="fUrl" placeholder="http://frigate:5000">
 <p class="hint">URL where this container can reach Frigate</p></div>
-<div class="fg"><label>Public URL (for links in notifications)</label><input id="fPub" placeholder="https://frigate.example.com"></div>
-</div></div>
+<div class="fg"><label>Public URL (for notification links)</label><input id="fPub" placeholder="https://frigate.example.com"></div>
+</div>
+<div class="fg"><label>Alerts Public URL</label><input id="aPub" placeholder="https://alerts.example.com">
+<p class="hint">Public URL of this app. Enables snooze buttons in notifications and event video pages. Leave blank if not exposed.</p></div>
+</div>
 
-<!-- MQTT (optional) -->
+<!-- Media -->
+<div class="card"><h3>Media</h3>
+<div class="g2">
+<div class="fg"><label>Media type</label>
+<select id="mType"><option value="gif">Animated GIF (default)</option><option value="snapshot">Snapshot (still image)</option><option value="clip">Video Clip (falls back to GIF)</option></select>
+<p class="hint">What to attach to notifications. Video clips are supported by Discord and Telegram. Pushover always gets GIF/snapshot.</p></div>
+<div class="fg"><label>GIF delay (seconds)</label><input id="gDel" type="number" value="10">
+<p class="hint">Wait time before fetching media (Frigate needs time to generate it)</p></div>
+</div>
+<div class="fg"><label>GIF retries</label><input id="gRet" type="number" value="3" style="width:100px"></div>
+</div>
+
+<!-- Message Templates -->
+<div class="card"><h3>Message Templates <span class="opt-tag">Optional</span></h3>
+<p class="hint" style="margin-bottom:10px">Customize notification text. Variables: {camera}, {label}, {zone}, {time}, {date}. Leave blank for defaults.</p>
+<div class="fg"><label>Title template</label><input id="tplT" placeholder="{label} - {camera}"></div>
+<div class="fg"><label>Message template</label><input id="tplM" placeholder="{label} detected on {camera}">
+<p class="hint">Default: "{label} detected on {camera} ({zone})"</p></div>
+</div>
+
+<!-- MQTT -->
 <div class="card"><h3>MQTT <span class="opt-tag">Optional</span> <label class="tog" style="font-weight:400"><input type="checkbox" id="mqE"> Enable</label></h3>
 <div class="prov-body" id="mqB">
-<p class="hint" style="margin-bottom:10px">By default, Frigate Alerts polls Frigate's API directly. Enable MQTT for faster delivery via an existing broker — it won't affect your Home Assistant or other MQTT consumers.</p>
+<p class="hint" style="margin-bottom:10px">By default, Frigate Alerts polls Frigate's API. Enable MQTT for faster delivery via an existing broker. This won't affect your Home Assistant or other MQTT consumers.</p>
 <div class="g2">
 <div class="fg"><label>Server</label><input id="mSrv" placeholder="10.0.0.1"></div>
 <div class="fg"><label>Port</label><input id="mPort" type="number" value="1883"></div>
@@ -108,11 +130,7 @@ td{padding:7px;border-bottom:1px solid var(--bd)}
 <div class="fg"><label>Labels (empty = all)</label>
 <div style="display:flex;gap:5px"><input id="lI" placeholder="person, car, dog..." style="flex:1"><button class="btn bs bsm" onclick="aChip('lbl')">Add</button></div>
 <div class="cl" id="lblC"></div></div>
-<div class="g2">
-<div class="fg"><label>GIF delay (seconds)</label><input id="gDel" type="number" value="10">
-<p class="hint">Wait time before fetching GIF</p></div>
-<div class="fg"><label>GIF retries</label><input id="gRet" type="number" value="3"></div>
-</div></div>
+</div>
 
 <!-- Zones -->
 <div class="card"><h3>Zone Filtering <span class="opt-tag">Optional</span></h3>
@@ -128,13 +146,13 @@ td{padding:7px;border-bottom:1px solid var(--bd)}
 <!-- Cooldown -->
 <div class="card"><h3>Cooldown</h3>
 <div class="fg"><label>Cooldown per camera (seconds)</label><input id="cdSec" type="number" value="0" min="0">
-<p class="hint">Minimum time between notifications for the same camera. 0 = disabled. Recommended: 300 (5 min).</p></div>
+<p class="hint">Minimum time between notifications for the same camera. 0 = disabled. 300 (5 min) recommended.</p></div>
 </div>
 
 <!-- Quiet Hours -->
 <div class="card"><h3>Quiet Hours <label class="tog" style="font-weight:400"><input type="checkbox" id="qhE"> Enable</label></h3>
 <div class="prov-body" id="qhB">
-<p class="hint" style="margin-bottom:10px">Suppress all notifications during these hours. Supports wrapping past midnight (e.g. 23:00 to 06:00).</p>
+<p class="hint" style="margin-bottom:10px">Suppress all notifications during these hours. Works across midnight (e.g. 23:00 to 06:00).</p>
 <div class="g2">
 <div class="fg"><label>Start time</label><input id="qhS" type="time" value="23:00"></div>
 <div class="fg"><label>End time</label><input id="qhEnd" type="time" value="06:00"></div>
@@ -144,9 +162,9 @@ td{padding:7px;border-bottom:1px solid var(--bd)}
 <div class="card"><h3>Snooze</h3>
 <p class="hint" style="margin-bottom:10px">Temporarily silence all notifications.</p>
 <div class="br" style="margin-top:0">
-<button class="btn bw" onclick="snooze(10)">Snooze 10 min</button>
-<button class="btn bw" onclick="snooze(30)">Snooze 30 min</button>
-<button class="btn bw" onclick="snooze(60)">Snooze 1 hour</button>
+<button class="btn bw" onclick="snooze(10)">10 min</button>
+<button class="btn bw" onclick="snooze(30)">30 min</button>
+<button class="btn bw" onclick="snooze(60)">1 hour</button>
 <button class="btn bs" onclick="unsnooze()" id="snzCancel" style="display:none">Cancel Snooze</button>
 </div></div>
 
@@ -160,9 +178,20 @@ td{padding:7px;border-bottom:1px solid var(--bd)}
 <div class="card"><h3>Pushover <label class="tog" style="font-weight:400;font-size:.83rem"><input type="checkbox" id="poE"> Enable</label></h3>
 <div class="prov-body" id="poB"><div class="g2">
 <div class="fg"><label>App token</label><input id="poT"></div>
-<div class="fg"><label>Sound</label><input id="poS" placeholder="pushover"></div>
-</div><div class="fg"><label>Recipients</label><div id="poR"></div>
-<div style="display:flex;gap:5px;margin-top:5px"><input id="poN" placeholder="Name" style="width:100px"><input id="poK" placeholder="User key" style="flex:1"><button class="btn bs bsm" onclick="aR()">Add</button></div>
+<div class="fg"><label>Default sound</label><input id="poS" placeholder="pushover"></div>
+</div>
+<div class="fg"><label>Default priority</label>
+<select id="poPri"><option value="-2">Lowest (-2)</option><option value="-1">Low (-1)</option><option value="0" selected>Normal (0)</option><option value="1">High (1)</option><option value="2">Emergency (2)</option></select></div>
+<div class="fg"><label>Recipients</label><div id="poR"></div>
+<div style="display:flex;gap:5px;margin-top:5px"><input id="poN" placeholder="Name" style="width:100px"><input id="poK" placeholder="User key" style="flex:1"><button class="btn bs bsm" onclick="aR()">Add</button></div></div>
+<div class="fg" style="margin-top:10px"><label>Per-camera overrides</label>
+<p class="hint" style="margin-bottom:5px">Set different sound or priority for specific cameras (e.g. doorbell = emergency).</p>
+<div id="poOvr"></div>
+<div style="display:flex;gap:5px;margin-top:5px">
+<input id="poOC" placeholder="Camera" style="width:120px">
+<input id="poOS" placeholder="Sound" style="width:100px">
+<select id="poOP" style="width:100px"><option value="">Default</option><option value="-1">Low</option><option value="0">Normal</option><option value="1">High</option><option value="2">Emergency</option></select>
+<button class="btn bs bsm" onclick="aOvr()">Add</button></div>
 </div></div></div>
 
 <!-- Discord -->
@@ -228,14 +257,13 @@ td{padding:7px;border-bottom:1px solid var(--bd)}
 
 <script>
 const $=id=>document.getElementById(id);
-let cam=[],lbl=[],za=[],zb=[],poRec=[],dcWh=[];
+let cam=[],lbl=[],za=[],zb=[],poRec=[],poOvr=[],dcWh=[];
 
-// Chip list mappings
 const chipCfg={
-    cam:{arr:()=>cam,set:v=>{cam=v},inp:'cI',el:'camC'},
-    lbl:{arr:()=>lbl,set:v=>{lbl=v},inp:'lI',el:'lblC'},
-    za:{arr:()=>za,set:v=>{za=v},inp:'zaI',el:'zaC'},
-    zb:{arr:()=>zb,set:v=>{zb=v},inp:'zbI',el:'zbC'},
+cam:{arr:()=>cam,set:v=>{cam=v},inp:'cI',el:'camC'},
+lbl:{arr:()=>lbl,set:v=>{lbl=v},inp:'lI',el:'lblC'},
+za:{arr:()=>za,set:v=>{za=v},inp:'zaI',el:'zaC'},
+zb:{arr:()=>zb,set:v=>{zb=v},inp:'zbI',el:'zbC'},
 };
 
 document.querySelectorAll('.tab').forEach(t=>t.onclick=()=>{
@@ -261,6 +289,13 @@ function rR(){$('poR').innerHTML=poRec.map((r,i)=>
 function aR(){const n=$('poN').value.trim(),k=$('poK').value.trim();if(!n||!k)return;
 poRec.push({name:n,userkey:k});rR();$('poN').value='';$('poK').value=''}
 
+function rOvr(){$('poOvr').innerHTML=poOvr.map((o,i)=>
+`<div class="ri"><span class="n">${o.camera}</span><span class="k">sound: ${o.sound||'default'}, priority: ${o.priority||'default'}</span><button class="btn bsm bd" onclick="poOvr.splice(${i},1);rOvr()">&times;</button></div>`).join('')}
+
+function aOvr(){const c=$('poOC').value.trim(),s=$('poOS').value.trim(),p=$('poOP').value;if(!c)return;
+const o={camera:c};if(s)o.sound=s;if(p!=='')o.priority=+p;
+poOvr.push(o);rOvr();$('poOC').value='';$('poOS').value='';$('poOP').value=''}
+
 function rW(){$('dcW').innerHTML=dcWh.map((w,i)=>
 `<div class="ri"><span class="n">${w.name}</span><span class="k">${w.url.substring(0,45)}...</span><button class="btn bsm bd" onclick="dcWh.splice(${i},1);rW()">&times;</button></div>`).join('')}
 
@@ -269,6 +304,9 @@ dcWh.push({name:n,url:u});rW();$('dcN').value='';$('dcU').value=''}
 
 async function lC(){try{const r=await fetch('/api/config');const c=await r.json();
 $('fUrl').value=c.frigate?.url||'';$('fPub').value=c.frigate?.public_url||'';
+$('aPub').value=c.alerts_public_url||'';
+$('mType').value=c.media_type||'gif';
+$('tplT').value=c.title_template||'';$('tplM').value=c.message_template||'';
 $('mqE').checked=c.mqtt?.enabled||false;
 $('mSrv').value=c.mqtt?.server||'';$('mPort').value=c.mqtt?.port||1883;
 $('mUsr').value=c.mqtt?.username||'';$('mPwd').value=c.mqtt?.password||'';
@@ -281,7 +319,9 @@ $('qhE').checked=c.quiet_hours?.enabled||false;
 $('qhS').value=c.quiet_hours?.start||'23:00';$('qhEnd').value=c.quiet_hours?.end||'06:00';
 $('retDays').value=c.history_retention_days||30;
 $('poE').checked=c.pushover?.enabled||false;$('poT').value=c.pushover?.token||'';
-$('poS').value=c.pushover?.sound||'pushover';poRec=c.pushover?.recipients||[];rR();
+$('poS').value=c.pushover?.sound||'pushover';$('poPri').value=String(c.pushover?.priority||0);
+poRec=c.pushover?.recipients||[];rR();
+poOvr=c.pushover?.camera_overrides||[];rOvr();
 $('dcE').checked=c.discord?.enabled||false;dcWh=c.discord?.webhooks||[];rW();
 $('tgE').checked=c.telegram?.enabled||false;$('tgT').value=c.telegram?.token||c.telegram?.bot_token||'';$('tgC').value=c.telegram?.chat_id||'';
 $('ntE').checked=c.ntfy?.enabled||false;$('ntS').value=c.ntfy?.server||c.ntfy?.url||'https://ntfy.sh';$('ntT').value=c.ntfy?.topic||'';$('ntK').value=c.ntfy?.token||'';
@@ -291,8 +331,13 @@ $('emU').value=c.smtp?.username||'';$('emW').value=c.smtp?.password||'';$('emR')
 $('whE').checked=c.webhook?.enabled||false;$('whU').value=c.webhook?.url||'';$('whM').value=c.webhook?.method||'POST';
 }catch(e){toast('Failed to load config',false)}}
 
-function bC(){return{
+function bC(){
+const tplT=$('tplT').value.trim(),tplM=$('tplM').value.trim();
+return{
 frigate:{url:$('fUrl').value,public_url:$('fPub').value},
+alerts_public_url:$('aPub').value,
+media_type:$('mType').value,
+title_template:tplT||undefined,message_template:tplM||undefined,
 mqtt:{enabled:$('mqE').checked,server:$('mSrv').value,port:+$('mPort').value||1883,username:$('mUsr').value,password:$('mPwd').value,topic_prefix:$('mPfx').value||'frigate',client_id:'frigate-alerts'},
 cameras:cam,labels:lbl,
 zones:{allow:za,block:zb},
@@ -300,7 +345,7 @@ cooldown:+$('cdSec').value||0,
 quiet_hours:{enabled:$('qhE').checked,start:$('qhS').value,end:$('qhEnd').value},
 history_retention_days:+$('retDays').value||30,
 gif_delay:+$('gDel').value||10,gif_retries:+$('gRet').value||3,gif_retry_interval:5,
-pushover:{enabled:$('poE').checked,token:$('poT').value,sound:$('poS').value,priority:0,recipients:poRec},
+pushover:{enabled:$('poE').checked,token:$('poT').value,sound:$('poS').value,priority:+$('poPri').value||0,recipients:poRec,camera_overrides:poOvr},
 discord:{enabled:$('dcE').checked,webhooks:dcWh},
 telegram:{enabled:$('tgE').checked,token:$('tgT').value,chat_id:$('tgC').value},
 ntfy:{enabled:$('ntE').checked,server:$('ntS').value,topic:$('ntT').value,token:$('ntK').value},
@@ -312,10 +357,10 @@ async function save(){try{const r=await fetch('/api/config',{method:'POST',heade
 const d=await r.json();if(d.status==='ok')toast('Saved!');else toast('Error',false)}catch(e){toast('Error: '+e,false)}}
 
 async function test(){toast('Sending test...');try{const r=await fetch('/api/test',{method:'POST'});const d=await r.json();
-if(d.status==='ok')toast(`Test sent! ${d.camera} — ${d.label}`);else toast(d.message||'Failed',false)}catch(e){toast('Error: '+e,false)}}
+if(d.status==='ok')toast('Test sent! '+d.camera+' / '+d.label);else toast(d.message||'Failed',false)}catch(e){toast('Error: '+e,false)}}
 
 async function snooze(min){try{const r=await fetch('/api/snooze',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({minutes:min})});
-const d=await r.json();if(d.status==='ok')toast(`Snoozed for ${min} min`);cS()}catch(e){toast('Error: '+e,false)}}
+const d=await r.json();if(d.status==='ok')toast('Snoozed for '+min+' min');cS()}catch(e){toast('Error: '+e,false)}}
 
 async function unsnooze(){try{await fetch('/api/snooze/cancel',{method:'POST'});toast('Snooze cancelled');cS()}catch(e){toast('Error: '+e,false)}}
 
@@ -329,22 +374,18 @@ $('fd').className='dot '+(s.frigate_connected?'g':'r');$('fs').textContent=s.fri
 $('pd').className='dot '+(s.poller_running?'g':'r');$('ps').textContent=s.poller_running?'Running':'Stopped';
 if(s.mqtt_enabled){$('mqttBadge').style.display='flex';$('md').className='dot '+(s.mqtt_connected?'g':'y');$('ms').textContent=s.mqtt_connected?'Connected':'Disconnected'}
 else{$('mqttBadge').style.display='none'}
-// Snooze
 if(s.snoozed){$('snzBar').style.display='flex';$('snzCancel').style.display='';updateSnoozeTimer(s.snooze_remaining)}
 else{$('snzBar').style.display='none';$('snzCancel').style.display='none'}
-// Quiet hours
 $('quietBadge').style.display=s.quiet_hours_active?'flex':'none';
 }catch(e){}}
 
 let snzInterval;
 function updateSnoozeTimer(secs){
-clearInterval(snzInterval);
-let rem=secs;
+clearInterval(snzInterval);let rem=secs;
 const tick=()=>{if(rem<=0){$('snzBar').style.display='none';clearInterval(snzInterval);return}
 const m=Math.floor(rem/60),s=rem%60;$('snzTime').textContent=m+':'+(s<10?'0':'')+s;rem--};
 tick();snzInterval=setInterval(tick,1000)}
 
-// Enter key on chip inputs
 ['cI','lI','zaI','zbI'].forEach(id=>$(id).onkeydown=e=>{
 if(e.key==='Enter'){e.preventDefault();
 const map={cI:'cam',lI:'lbl',zaI:'za',zbI:'zb'};aChip(map[id])}});

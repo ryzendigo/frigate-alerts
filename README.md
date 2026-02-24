@@ -1,6 +1,6 @@
 # Frigate Alerts
 
-Animated GIF notifications from [Frigate NVR](https://frigate.video) events. Get instant push notifications with a preview GIF of what triggered the alert — not just a still image.
+Animated GIF notifications from [Frigate NVR](https://frigate.video) events. Get instant push notifications with a preview GIF of what triggered the alert, not just a still image.
 
 ![Web UI](https://img.shields.io/badge/Web_UI-included-blue) ![Docker](https://img.shields.io/badge/Docker-ready-blue) ![License](https://img.shields.io/badge/License-MIT-green)
 
@@ -9,16 +9,22 @@ Animated GIF notifications from [Frigate NVR](https://frigate.video) events. Get
 Frigate generates animated preview GIFs for every detection event, but existing notification tools only send still snapshots. This project sends the actual animated GIF so you can see what happened at a glance.
 
 **Features:**
-- Animated GIF notifications (with snapshot fallback)
+- Animated GIF, snapshot, or video clip notifications (configurable per instance)
 - **7 notification providers**: Pushover, Discord, Telegram, Ntfy, Gotify, Email (SMTP), Webhook
-- **Zero dependencies** — works out of the box with just a Frigate URL
+- **Zero dependencies** - works out of the box with just a Frigate URL
 - **Optional MQTT** for faster delivery (with automatic API fallback)
-- **Web UI** for configuration — no YAML editing required
+- **Web UI** for configuration - no YAML editing required
+- Event video page with embedded player (linked from notifications)
+- Snooze buttons in Pushover notifications
+- Discord rich embeds with color, fields, and timestamps
+- Customizable message templates with variables
+- Per-camera Pushover sound and priority overrides
+- Cooldown per camera to prevent notification spam
+- Zone allow/block filtering
+- Quiet hours (suppress during sleep)
 - Notification history with timestamps and status
-- Test notification button
-- Camera and label filtering
-- Multiple recipients per provider
-- Tap notification to open the event in Frigate
+- Auto-cleanup of old history records
+- Docker healthcheck endpoint
 - Single Docker container, minimal resource usage
 
 ## How It Works
@@ -30,37 +36,37 @@ Frigate Alerts has two ways to detect events, and both can run at the same time:
 | **API Polling** (default) | ~10 seconds | Just Frigate URL | Zero config |
 | **MQTT** (optional) | Instant | MQTT broker details | Add broker in settings |
 
-**By default, only API polling is used** — it queries Frigate's API every 10 seconds for new completed alerts. This means you don't need an MQTT broker, and it doesn't touch your Home Assistant or any other system.
+**By default, only API polling is used.** It queries Frigate's API every 10 seconds for new completed alerts. This means you don't need an MQTT broker, and it doesn't touch your Home Assistant or any other system.
 
 **If you add MQTT**, both modes run simultaneously. MQTT delivers instantly, and the API poller acts as an automatic fallback if MQTT ever disconnects. Events are deduplicated so you'll never get double notifications.
 
 ```
-                               ┌─── MQTT (optional, instant) ───┐
-Frigate NVR ──┤                                                  ├──▶ Frigate Alerts ──▶ Notifications
-                               └─── API Polling (default) ──────┘
-                                                                          ↓
+                               +--- MQTT (optional, instant) ---+
+Frigate NVR --+                                                  +-->  Frigate Alerts --> Notifications
+                               +--- API Polling (default) ------+
+                                                                          |
                                                                Fetches preview.gif
                                                                from Frigate API
 ```
 
 1. Frigate Alerts detects completed alert reviews (via API polling and/or MQTT)
-2. Filters by camera and label based on your settings
+2. Filters by camera, label, and zone based on your settings
 3. Waits briefly for Frigate to generate the preview GIF
-4. Fetches the GIF from Frigate's API (`/api/events/{id}/preview.gif`)
-5. Sends it as an animated attachment to all enabled providers
+4. Fetches the media from Frigate's API (GIF, snapshot, or video clip)
+5. Sends it as an attachment to all enabled providers
 6. Falls back to a snapshot image if the GIF isn't available
 
 ## Supported Providers
 
 | Provider | GIF Support | Features |
 |----------|------------|----------|
-| **Pushover** | Animated GIF | Multiple recipients, priority levels, custom sounds |
-| **Discord** | Animated GIF | Multiple webhooks, embedded previews |
-| **Telegram** | Animated GIF | Bot API, sendAnimation/sendPhoto |
+| **Pushover** | Animated GIF | Multiple recipients, priority levels, custom sounds, per-camera overrides, snooze buttons |
+| **Discord** | Animated GIF | Multiple webhooks, rich embeds with color and fields |
+| **Telegram** | Animated GIF | Bot API, sendAnimation/sendPhoto/sendVideo |
 | **Ntfy** | Attached image | Self-hosted or ntfy.sh, token auth |
 | **Gotify** | Link only | Self-hosted, priority levels, markdown |
 | **Email (SMTP)** | Attached image | Multiple recipients, TLS, any SMTP server |
-| **Webhook** | JSON payload | Custom URL, headers, POST/PUT method |
+| **Webhook** | JSON payload | Custom URL, headers, POST/PUT method, full event data |
 
 ## Quick Start
 
@@ -83,15 +89,21 @@ services:
 ### 2. Open the web UI
 
 Go to `http://your-host:8085` and configure:
-- **Frigate URL** — the internal URL where this container can reach Frigate (e.g. `http://frigate:5000`)
-- **At least one notification provider** — enable and configure Pushover, Discord, etc.
+- **Frigate URL** - the internal URL where this container can reach Frigate (e.g. `http://frigate:5000`)
+- **At least one notification provider** - enable and configure Pushover, Discord, etc.
 - **Click Save**
 
 That's it. Notifications will start flowing on the next alert.
 
 ### 3. (Optional) Add MQTT for instant delivery
 
-If you have an MQTT broker (Home Assistant, Mosquitto, etc.), enable MQTT in settings and add the broker details. This won't affect your existing MQTT setup — Frigate Alerts is just a passive subscriber.
+If you have an MQTT broker (Home Assistant, Mosquitto, etc.), enable MQTT in settings and add the broker details. This won't affect your existing MQTT setup - Frigate Alerts is just a passive subscriber.
+
+### 4. (Optional) Set up event video pages
+
+If you expose Frigate Alerts publicly (or via reverse proxy), set the **Alerts Public URL** in settings. This enables:
+- Event video pages with an embedded player (linked from notifications)
+- Snooze buttons in Pushover notifications
 
 ## Alternative Install Methods
 
@@ -117,14 +129,14 @@ docker run -d -p 8085:8000 -v $(pwd)/config:/app/config frigate-alerts
 
 ## Configuration
 
-Everything can be configured through the web UI. Or edit `config/config.yml` directly — copy `config/config.example.yml` to get started:
+Everything can be configured through the web UI. Or edit `config/config.yml` directly - copy `config/config.example.yml` to get started:
 
 ```yaml
 frigate:
   url: http://frigate:5000
   public_url: https://frigate.example.com  # for links in notifications
 
-# Optional — leave disabled to use API polling only
+# Optional - leave disabled to use API polling only
 mqtt:
   enabled: false
   server: 10.0.0.1
@@ -148,12 +160,28 @@ pushover:
 
 See `config/config.example.yml` for the full list of options including all providers.
 
+## Message Templates
+
+Customize notification titles and messages using variables:
+
+| Variable | Example |
+|----------|---------|
+| `{camera}` | front_door |
+| `{label}` | Person |
+| `{zone}` | driveway |
+| `{time}` | 14:30:00 |
+| `{date}` | 2025-01-15 |
+
+Default title: `{label} - {camera}`
+Default message: `Person detected on front_door (driveway)`
+
 ## Provider Setup
 
 ### Pushover
-1. Create an app at [pushover.net/apps](https://pushover.net/apps/build) — note the **API Token**
+1. Create an app at [pushover.net/apps](https://pushover.net/apps/build) and note the **API Token**
 2. Find your **User Key** on the [Pushover dashboard](https://pushover.net/)
 3. Animated GIFs require Pushover client v3.4+
+4. Per-camera overrides let you set different sounds/priorities (e.g. doorbell = emergency)
 
 ### Discord
 1. In your Discord server, go to **Server Settings > Integrations > Webhooks**
@@ -177,18 +205,23 @@ See `config/config.example.yml` for the full list of options including all provi
 
 ### Webhook
 1. Point to any HTTP endpoint that accepts JSON
-2. Payload includes: title, message, url, image_type, event data
+2. Payload includes: title, message, url, image_type, event data (review_id, event_id, camera, label, zones, video_url)
 
 ## API Endpoints
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/` | GET | Web UI |
+| `/event/{event_id}` | GET | Event video/media page |
 | `/api/config` | GET | Get current configuration |
 | `/api/config` | POST | Update configuration |
 | `/api/history` | GET | Notification history (`?limit=50`) |
 | `/api/status` | GET | Connection status (Frigate, poller, MQTT) |
 | `/api/test` | POST | Send test notification using latest event |
+| `/api/snooze` | POST | Snooze notifications (`{"minutes": 30}`) |
+| `/api/snooze/cancel` | POST | Cancel active snooze |
+| `/api/snooze/quick` | GET | Quick snooze via URL (`?minutes=30`) |
+| `/api/health` | GET | Health check endpoint |
 
 ## Requirements
 

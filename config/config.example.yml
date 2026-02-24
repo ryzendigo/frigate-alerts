@@ -2,7 +2,11 @@ frigate:
   url: http://frigate:5000
   public_url: https://frigate.example.com
 
-# MQTT is optional — by default, Frigate Alerts polls Frigate's API directly.
+# Public URL of this app (enables snooze buttons in notifications and event video pages)
+# Leave blank if not exposed publicly
+alerts_public_url: ""
+
+# MQTT is optional - by default, Frigate Alerts polls Frigate's API directly.
 # Only enable this if you want faster notifications via an existing MQTT broker.
 mqtt:
   enabled: false
@@ -13,6 +17,15 @@ mqtt:
   topic_prefix: frigate
   client_id: frigate-alerts
 
+# Media type to attach: gif, snapshot, or clip
+# clip = video mp4 (falls back to GIF if unavailable)
+media_type: gif
+
+# Message templates (variables: {camera}, {label}, {zone}, {time}, {date})
+# Leave blank for defaults
+# title_template: "{label} - {camera}"
+# message_template: "{label} detected on {camera}"
+
 # Only notify for these cameras (empty list = all cameras)
 cameras: []
 
@@ -20,7 +33,7 @@ cameras: []
 labels:
   - person
 
-# Zone filtering (optional — empty = all zones allowed)
+# Zone filtering (optional - empty = all zones allowed)
 zones:
   allow: []
   block: []
@@ -28,7 +41,7 @@ zones:
 # Cooldown per camera in seconds (0 = disabled, 300 = 5 min recommended)
 cooldown: 0
 
-# Quiet hours — suppress notifications during these times
+# Quiet hours - suppress notifications during these times
 quiet_hours:
   enabled: false
   start: "23:00"
@@ -50,6 +63,11 @@ pushover:
   recipients:
     - name: User
       userkey: your_user_key
+  # Per-camera sound/priority overrides
+  # camera_overrides:
+  #   - camera: doorbell
+  #     sound: bike
+  #     priority: 1
 
 discord:
   enabled: false

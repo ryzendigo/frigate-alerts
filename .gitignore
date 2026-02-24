@@ -6,5 +6,5 @@ config/alerts.db
 dist/
 .venv/
 
-# Don't commit actual config with credentials — only the example
+# Don't commit actual config with credentials - only the example
 config/config.yml

@@ -1,4 +1,4 @@
-"""SMTP (email) notification provider — sends with image attachment."""
+"""SMTP (email) notification provider. Sends with image attachment."""
 
 import logging
 import smtplib
