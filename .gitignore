@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.env
+config/alerts.db
+*.egg-info/
+dist/
+.venv/
+
+# Don't commit actual config with credentials — only the example
+config/config.yml

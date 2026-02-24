@@ -1,0 +1,92 @@
+frigate:
+  url: http://frigate:5000
+  public_url: https://frigate.example.com
+
+# MQTT is optional — by default, Frigate Alerts polls Frigate's API directly.
+# Only enable this if you want faster notifications via an existing MQTT broker.
+mqtt:
+  enabled: false
+  server: 10.0.0.1
+  port: 1883
+  username: mqtt
+  password: your_password
+  topic_prefix: frigate
+  client_id: frigate-alerts
+
+# Only notify for these cameras (empty list = all cameras)
+cameras: []
+
+# Only notify for these labels (empty list = all labels)
+labels:
+  - person
+
+# Zone filtering (optional — empty = all zones allowed)
+zones:
+  allow: []
+  block: []
+
+# Cooldown per camera in seconds (0 = disabled, 300 = 5 min recommended)
+cooldown: 0
+
+# Quiet hours — suppress notifications during these times
+quiet_hours:
+  enabled: false
+  start: "23:00"
+  end: "06:00"
+
+# How many days to keep notification history (auto-cleaned)
+history_retention_days: 30
+
+# Seconds to wait before fetching GIF (Frigate needs time to generate it)
+gif_delay: 10
+gif_retries: 3
+gif_retry_interval: 5
+
+pushover:
+  enabled: false
+  token: your_app_token
+  sound: pushover
+  priority: 0
+  recipients:
+    - name: User
+      userkey: your_user_key
+
+discord:
+  enabled: false
+  webhooks:
+    - name: Alerts
+      url: https://discord.com/api/webhooks/your_webhook_url
+
+telegram:
+  enabled: false
+  token: your_bot_token
+  chat_id: your_chat_id
+
+ntfy:
+  enabled: false
+  server: https://ntfy.sh
+  topic: frigate-alerts
+  token: ""
+
+gotify:
+  enabled: false
+  server: http://gotify:8080
+  token: your_app_token
+  priority: 5
+
+smtp:
+  enabled: false
+  server: smtp.gmail.com
+  port: 587
+  tls: true
+  username: you@gmail.com
+  password: your_app_password
+  from: you@gmail.com
+  recipients:
+    - recipient@example.com
+
+webhook:
+  enabled: false
+  url: https://your-webhook-url.com/endpoint
+  method: POST
+  headers: {}

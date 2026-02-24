@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Frigate Alerts</title>
+<style>
+:root{--bg:#0a0a0a;--s1:#141414;--s2:#1e1e1e;--bd:#2a2a2a;--t:#e4e4e7;--td:#71717a;--ac:#3b82f6;--ah:#2563eb;--g:#22c55e;--r:#ef4444;--y:#eab308;--o:#f97316;--rd:8px}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:var(--bg);color:var(--t);line-height:1.5}
+.wrap{max-width:900px;margin:0 auto;padding:20px}
+h1{font-size:1.4rem;font-weight:600}h1 span{color:var(--ac)}
+.sub{color:var(--td);font-size:.82rem;margin-bottom:20px}
+.sr{display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap;align-items:center}
+.sb{display:flex;align-items:center;gap:6px;padding:5px 12px;background:var(--s2);border-radius:var(--rd);font-size:.83rem}
+.dot{width:8px;height:8px;border-radius:50%}.dot.g{background:var(--g)}.dot.r{background:var(--r)}.dot.y{background:var(--y)}.dot.o{background:var(--o)}
+.tabs{display:flex;gap:2px;border-bottom:1px solid var(--bd);margin-bottom:16px}
+.tab{padding:7px 14px;cursor:pointer;color:var(--td);border:none;background:none;font-size:.88rem;border-bottom:2px solid transparent;transition:.15s}
+.tab:hover{color:var(--t)}.tab.on{color:var(--ac);border-bottom-color:var(--ac)}
+.pnl{display:none}.pnl.on{display:block}
+.card{background:var(--s1);border:1px solid var(--bd);border-radius:var(--rd);padding:14px;margin-bottom:10px}
+.card h3{font-size:.92rem;margin-bottom:10px;display:flex;align-items:center;justify-content:space-between}
+.g2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.g3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px}
+.fg{margin-bottom:10px}.fg label{display:block;font-size:.75rem;color:var(--td);margin-bottom:3px;text-transform:uppercase;letter-spacing:.5px}
+input,select,textarea{width:100%;padding:7px 10px;background:var(--s2);border:1px solid var(--bd);border-radius:var(--rd);color:var(--t);font-size:.88rem}
+input:focus,textarea:focus{outline:none;border-color:var(--ac)}
+.btn{padding:7px 14px;border:none;border-radius:var(--rd);cursor:pointer;font-size:.83rem;font-weight:500;transition:.15s}
+.bp{background:var(--ac);color:#fff}.bp:hover{background:var(--ah)}
+.bs{background:var(--s2);color:var(--t);border:1px solid var(--bd)}.bs:hover{border-color:var(--td)}
+.bd{background:var(--r);color:#fff}
+.bw{background:#78350f;color:#fbbf24;border:1px solid #92400e}.bw:hover{background:#92400e}
+.bsm{padding:3px 8px;font-size:.78rem}
+.br{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap}
+.tog{display:flex;align-items:center;gap:8px;cursor:pointer;font-size:.83rem}
+.tog input{width:auto;accent-color:var(--ac)}
+.cl{display:flex;flex-wrap:wrap;gap:5px;margin-top:5px}
+.ch{display:flex;align-items:center;gap:4px;padding:2px 9px;background:var(--s2);border:1px solid var(--bd);border-radius:14px;font-size:.78rem}
+.ch .x{cursor:pointer;color:var(--td);font-size:.95rem;line-height:1}.ch .x:hover{color:var(--r)}
+.ri{display:flex;align-items:center;gap:8px;padding:6px 8px;background:var(--s2);border-radius:var(--rd);margin-bottom:5px;font-size:.85rem}
+.ri .n{font-weight:500;min-width:70px}.ri .k{color:var(--td);font-family:monospace;font-size:.78rem;flex:1;overflow:hidden;text-overflow:ellipsis}
+table{width:100%;border-collapse:collapse;font-size:.83rem}
+th{text-align:left;padding:7px;color:var(--td);font-weight:500;font-size:.72rem;text-transform:uppercase;letter-spacing:.5px;border-bottom:1px solid var(--bd)}
+td{padding:7px;border-bottom:1px solid var(--bd)}
+.bg{padding:2px 7px;border-radius:10px;font-size:.73rem;font-weight:500}
+.bg-s{background:#052e16;color:var(--g)}.bg-e{background:#2d0a0a;color:var(--r)}
+.emp{text-align:center;padding:30px;color:var(--td)}
+.toast{position:fixed;bottom:20px;right:20px;padding:10px 18px;border-radius:var(--rd);font-size:.83rem;z-index:999;animation:fi .2s}
+.tok{background:#052e16;border:1px solid #166534;color:var(--g)}.ter{background:#2d0a0a;border:1px solid #991b1b;color:var(--r)}
+@keyframes fi{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
+@media(max-width:640px){.g2,.g3{grid-template-columns:1fr}.sr{flex-direction:column}}
+.prov-body{margin-top:10px}
+.hint{font-size:.75rem;color:var(--td);margin-top:4px}
+.opt-tag{font-size:.65rem;padding:1px 6px;border-radius:8px;background:var(--s2);border:1px solid var(--bd);color:var(--td);margin-left:6px;text-transform:uppercase}
+.snooze-bar{background:#78350f;border:1px solid #92400e;border-radius:var(--rd);padding:10px 14px;margin-bottom:12px;display:flex;align-items:center;justify-content:space-between;font-size:.85rem;color:#fbbf24}
+.snooze-bar .time{font-weight:600;font-variant-numeric:tabular-nums}
+</style>
+</head>
+<body>
+<div class="wrap">
+<h1>Frigate <span>Alerts</span></h1>
+<p class="sub">Animated GIF notifications from Frigate NVR</p>
+
+<!-- Snooze banner -->
+<div class="snooze-bar" id="snzBar" style="display:none">
+<span>Notifications snoozed — <span class="time" id="snzTime">0:00</span> remaining</span>
+<button class="btn bsm bs" onclick="unsnooze()">Cancel Snooze</button>
+</div>
+
+<!-- Status badges -->
+<div class="sr" id="st">
+<div class="sb"><div class="dot" id="fd"></div>Frigate <span id="fs">...</span></div>
+<div class="sb"><div class="dot" id="pd"></div>Poller <span id="ps">...</span></div>
+<div class="sb" id="mqttBadge" style="display:none"><div class="dot" id="md"></div>MQTT <span id="ms">...</span></div>
+<div class="sb" id="quietBadge" style="display:none"><div class="dot o"></div>Quiet Hours</div>
+</div>
+
+<div class="tabs">
+<button class="tab on" data-t="cfg">Settings</button>
+<button class="tab" data-t="hist">History</button>
+</div>
+
+<div class="pnl on" id="cfg">
+<!-- Frigate -->
+<div class="card"><h3>Frigate</h3><div class="g2">
+<div class="fg"><label>Internal URL</label><input id="fUrl" placeholder="http://frigate:5000">
+<p class="hint">URL where this container can reach Frigate</p></div>
+<div class="fg"><label>Public URL (for links in notifications)</label><input id="fPub" placeholder="https://frigate.example.com"></div>
+</div></div>
+
+<!-- MQTT (optional) -->
+<div class="card"><h3>MQTT <span class="opt-tag">Optional</span> <label class="tog" style="font-weight:400"><input type="checkbox" id="mqE"> Enable</label></h3>
+<div class="prov-body" id="mqB">
+<p class="hint" style="margin-bottom:10px">By default, Frigate Alerts polls Frigate's API directly. Enable MQTT for faster delivery via an existing broker — it won't affect your Home Assistant or other MQTT consumers.</p>
+<div class="g2">
+<div class="fg"><label>Server</label><input id="mSrv" placeholder="10.0.0.1"></div>
+<div class="fg"><label>Port</label><input id="mPort" type="number" value="1883"></div>
+<div class="fg"><label>Username</label><input id="mUsr"></div>
+<div class="fg"><label>Password</label><input id="mPwd" type="password"></div>
+</div><div class="fg"><label>Topic prefix</label><input id="mPfx" placeholder="frigate"></div>
+</div></div>
+
+<!-- Filters -->
+<div class="card"><h3>Filters</h3>
+<div class="fg"><label>Cameras (empty = all)</label>
+<div style="display:flex;gap:5px"><input id="cI" placeholder="camera name..." style="flex:1"><button class="btn bs bsm" onclick="aChip('cam')">Add</button></div>
+<div class="cl" id="camC"></div></div>
+<div class="fg"><label>Labels (empty = all)</label>
+<div style="display:flex;gap:5px"><input id="lI" placeholder="person, car, dog..." style="flex:1"><button class="btn bs bsm" onclick="aChip('lbl')">Add</button></div>
+<div class="cl" id="lblC"></div></div>
+<div class="g2">
+<div class="fg"><label>GIF delay (seconds)</label><input id="gDel" type="number" value="10">
+<p class="hint">Wait time before fetching GIF</p></div>
+<div class="fg"><label>GIF retries</label><input id="gRet" type="number" value="3"></div>
+</div></div>
+
+<!-- Zones -->
+<div class="card"><h3>Zone Filtering <span class="opt-tag">Optional</span></h3>
+<p class="hint" style="margin-bottom:10px">Only notify for specific Frigate zones. Leave both empty to allow all zones.</p>
+<div class="fg"><label>Allow zones (only notify for these)</label>
+<div style="display:flex;gap:5px"><input id="zaI" placeholder="driveway, front_yard..." style="flex:1"><button class="btn bs bsm" onclick="aChip('za')">Add</button></div>
+<div class="cl" id="zaC"></div></div>
+<div class="fg"><label>Block zones (never notify for these)</label>
+<div style="display:flex;gap:5px"><input id="zbI" placeholder="street, sidewalk..." style="flex:1"><button class="btn bs bsm" onclick="aChip('zb')">Add</button></div>
+<div class="cl" id="zbC"></div></div>
+</div>
+
+<!-- Cooldown -->
+<div class="card"><h3>Cooldown</h3>
+<div class="fg"><label>Cooldown per camera (seconds)</label><input id="cdSec" type="number" value="0" min="0">
+<p class="hint">Minimum time between notifications for the same camera. 0 = disabled. Recommended: 300 (5 min).</p></div>
+</div>
+
+<!-- Quiet Hours -->
+<div class="card"><h3>Quiet Hours <label class="tog" style="font-weight:400"><input type="checkbox" id="qhE"> Enable</label></h3>
+<div class="prov-body" id="qhB">
+<p class="hint" style="margin-bottom:10px">Suppress all notifications during these hours. Supports wrapping past midnight (e.g. 23:00 to 06:00).</p>
+<div class="g2">
+<div class="fg"><label>Start time</label><input id="qhS" type="time" value="23:00"></div>
+<div class="fg"><label>End time</label><input id="qhEnd" type="time" value="06:00"></div>
+</div></div></div>
+
+<!-- Snooze -->
+<div class="card"><h3>Snooze</h3>
+<p class="hint" style="margin-bottom:10px">Temporarily silence all notifications.</p>
+<div class="br" style="margin-top:0">
+<button class="btn bw" onclick="snooze(10)">Snooze 10 min</button>
+<button class="btn bw" onclick="snooze(30)">Snooze 30 min</button>
+<button class="btn bw" onclick="snooze(60)">Snooze 1 hour</button>
+<button class="btn bs" onclick="unsnooze()" id="snzCancel" style="display:none">Cancel Snooze</button>
+</div></div>
+
+<!-- History Retention -->
+<div class="card"><h3>History</h3>
+<div class="fg"><label>Keep history for (days)</label><input id="retDays" type="number" value="30" min="1">
+<p class="hint">Older entries are automatically deleted.</p></div>
+</div>
+
+<!-- Pushover -->
+<div class="card"><h3>Pushover <label class="tog" style="font-weight:400;font-size:.83rem"><input type="checkbox" id="poE"> Enable</label></h3>
+<div class="prov-body" id="poB"><div class="g2">
+<div class="fg"><label>App token</label><input id="poT"></div>
+<div class="fg"><label>Sound</label><input id="poS" placeholder="pushover"></div>
+</div><div class="fg"><label>Recipients</label><div id="poR"></div>
+<div style="display:flex;gap:5px;margin-top:5px"><input id="poN" placeholder="Name" style="width:100px"><input id="poK" placeholder="User key" style="flex:1"><button class="btn bs bsm" onclick="aR()">Add</button></div>
+</div></div></div>
+
+<!-- Discord -->
+<div class="card"><h3>Discord <label class="tog" style="font-weight:400;font-size:.83rem"><input type="checkbox" id="dcE"> Enable</label></h3>
+<div class="prov-body" id="dcB"><div class="fg"><label>Webhooks</label><div id="dcW"></div>
+<div style="display:flex;gap:5px;margin-top:5px"><input id="dcN" placeholder="Name" style="width:100px"><input id="dcU" placeholder="Webhook URL" style="flex:1"><button class="btn bs bsm" onclick="aW()">Add</button></div>
+</div></div></div>
+
+<!-- Telegram -->
+<div class="card"><h3>Telegram <label class="tog" style="font-weight:400;font-size:.83rem"><input type="checkbox" id="tgE"> Enable</label></h3>
+<div class="prov-body" id="tgB"><div class="g2">
+<div class="fg"><label>Bot token</label><input id="tgT" placeholder="123456:ABC-DEF..."></div>
+<div class="fg"><label>Chat ID</label><input id="tgC" placeholder="-1001234567890"></div>
+</div></div></div>
+
+<!-- Ntfy -->
+<div class="card"><h3>Ntfy <label class="tog" style="font-weight:400;font-size:.83rem"><input type="checkbox" id="ntE"> Enable</label></h3>
+<div class="prov-body" id="ntB"><div class="g2">
+<div class="fg"><label>Server</label><input id="ntS" placeholder="https://ntfy.sh"></div>
+<div class="fg"><label>Topic</label><input id="ntT" placeholder="my-frigate-alerts"></div>
+</div><div class="fg"><label>Access token (optional)</label><input id="ntK" placeholder="tk_..."></div>
+</div></div>
+
+<!-- Gotify -->
+<div class="card"><h3>Gotify <label class="tog" style="font-weight:400;font-size:.83rem"><input type="checkbox" id="goE"> Enable</label></h3>
+<div class="prov-body" id="goB"><div class="g2">
+<div class="fg"><label>Server URL</label><input id="goS" placeholder="http://gotify:8080"></div>
+<div class="fg"><label>App token</label><input id="goT"></div>
+</div></div></div>
+
+<!-- SMTP -->
+<div class="card"><h3>Email (SMTP) <label class="tog" style="font-weight:400;font-size:.83rem"><input type="checkbox" id="emE"> Enable</label></h3>
+<div class="prov-body" id="emB"><div class="g2">
+<div class="fg"><label>SMTP server</label><input id="emS" placeholder="smtp.gmail.com"></div>
+<div class="fg"><label>Port</label><input id="emP" type="number" value="587"></div>
+<div class="fg"><label>Username</label><input id="emU"></div>
+<div class="fg"><label>Password</label><input id="emW" type="password"></div>
+</div>
+<div class="fg"><label>Recipients (comma separated)</label><input id="emR" placeholder="user@example.com, other@example.com"></div>
+</div></div>
+
+<!-- Webhook -->
+<div class="card"><h3>Webhook <label class="tog" style="font-weight:400;font-size:.83rem"><input type="checkbox" id="whE"> Enable</label></h3>
+<div class="prov-body" id="whB"><div class="g2">
+<div class="fg"><label>URL</label><input id="whU" placeholder="https://example.com/hook"></div>
+<div class="fg"><label>Method</label><select id="whM"><option>POST</option><option>PUT</option></select></div>
+</div></div></div>
+
+<div class="br">
+<button class="btn bp" onclick="save()">Save Configuration</button>
+<button class="btn bs" onclick="test()">Send Test Notification</button>
+</div>
+</div>
+
+<!-- History tab -->
+<div class="pnl" id="hist">
+<div class="card" style="padding:0;overflow:auto">
+<table><thead><tr><th>Time</th><th>Camera</th><th>Label</th><th>Zones</th><th>Provider</th><th>To</th><th>Status</th></tr></thead>
+<tbody id="hB"><tr><td colspan="7" class="emp">Loading...</td></tr></tbody></table>
+</div><div class="br"><button class="btn bs" onclick="lH()">Refresh</button></div>
+</div>
+</div>
+
+<script>
+const $=id=>document.getElementById(id);
+let cam=[],lbl=[],za=[],zb=[],poRec=[],dcWh=[];
+
+// Chip list mappings
+const chipCfg={
+    cam:{arr:()=>cam,set:v=>{cam=v},inp:'cI',el:'camC'},
+    lbl:{arr:()=>lbl,set:v=>{lbl=v},inp:'lI',el:'lblC'},
+    za:{arr:()=>za,set:v=>{za=v},inp:'zaI',el:'zaC'},
+    zb:{arr:()=>zb,set:v=>{zb=v},inp:'zbI',el:'zbC'},
+};
+
+document.querySelectorAll('.tab').forEach(t=>t.onclick=()=>{
+document.querySelectorAll('.tab').forEach(x=>x.classList.remove('on'));
+document.querySelectorAll('.pnl').forEach(x=>x.classList.remove('on'));
+t.classList.add('on');$(t.dataset.t).classList.add('on');
+if(t.dataset.t==='hist')lH();
+});
+
+function toast(m,ok=true){const e=document.createElement('div');e.className='toast '+(ok?'tok':'ter');e.textContent=m;document.body.appendChild(e);setTimeout(()=>e.remove(),3000)}
+
+function rChips(t){const c=chipCfg[t];const arr=c.arr();
+$(c.el).innerHTML=arr.map((v,i)=>`<span class="ch">${v}<span class="x" onclick="rmChip('${t}',${i})">&times;</span></span>`).join('')}
+
+function rmChip(t,i){const c=chipCfg[t];const arr=c.arr();arr.splice(i,1);c.set(arr);rChips(t)}
+
+function aChip(t){const c=chipCfg[t];const inp=$(c.inp);const v=inp.value.trim();if(!v)return;
+c.arr().push(v);rChips(t);inp.value=''}
+
+function rR(){$('poR').innerHTML=poRec.map((r,i)=>
+`<div class="ri"><span class="n">${r.name}</span><span class="k">${r.userkey}</span><button class="btn bsm bd" onclick="poRec.splice(${i},1);rR()">&times;</button></div>`).join('')}
+
+function aR(){const n=$('poN').value.trim(),k=$('poK').value.trim();if(!n||!k)return;
+poRec.push({name:n,userkey:k});rR();$('poN').value='';$('poK').value=''}
+
+function rW(){$('dcW').innerHTML=dcWh.map((w,i)=>
+`<div class="ri"><span class="n">${w.name}</span><span class="k">${w.url.substring(0,45)}...</span><button class="btn bsm bd" onclick="dcWh.splice(${i},1);rW()">&times;</button></div>`).join('')}
+
+function aW(){const n=$('dcN').value.trim(),u=$('dcU').value.trim();if(!n||!u)return;
+dcWh.push({name:n,url:u});rW();$('dcN').value='';$('dcU').value=''}
+
+async function lC(){try{const r=await fetch('/api/config');const c=await r.json();
+$('fUrl').value=c.frigate?.url||'';$('fPub').value=c.frigate?.public_url||'';
+$('mqE').checked=c.mqtt?.enabled||false;
+$('mSrv').value=c.mqtt?.server||'';$('mPort').value=c.mqtt?.port||1883;
+$('mUsr').value=c.mqtt?.username||'';$('mPwd').value=c.mqtt?.password||'';
+$('mPfx').value=c.mqtt?.topic_prefix||'frigate';
+$('gDel').value=c.gif_delay||10;$('gRet').value=c.gif_retries||3;
+cam=c.cameras||[];lbl=c.labels||[];rChips('cam');rChips('lbl');
+za=c.zones?.allow||[];zb=c.zones?.block||[];rChips('za');rChips('zb');
+$('cdSec').value=c.cooldown||0;
+$('qhE').checked=c.quiet_hours?.enabled||false;
+$('qhS').value=c.quiet_hours?.start||'23:00';$('qhEnd').value=c.quiet_hours?.end||'06:00';
+$('retDays').value=c.history_retention_days||30;
+$('poE').checked=c.pushover?.enabled||false;$('poT').value=c.pushover?.token||'';
+$('poS').value=c.pushover?.sound||'pushover';poRec=c.pushover?.recipients||[];rR();
+$('dcE').checked=c.discord?.enabled||false;dcWh=c.discord?.webhooks||[];rW();
+$('tgE').checked=c.telegram?.enabled||false;$('tgT').value=c.telegram?.token||c.telegram?.bot_token||'';$('tgC').value=c.telegram?.chat_id||'';
+$('ntE').checked=c.ntfy?.enabled||false;$('ntS').value=c.ntfy?.server||c.ntfy?.url||'https://ntfy.sh';$('ntT').value=c.ntfy?.topic||'';$('ntK').value=c.ntfy?.token||'';
+$('goE').checked=c.gotify?.enabled||false;$('goS').value=c.gotify?.server||'';$('goT').value=c.gotify?.token||'';
+$('emE').checked=c.smtp?.enabled||false;$('emS').value=c.smtp?.server||'';$('emP').value=c.smtp?.port||587;
+$('emU').value=c.smtp?.username||'';$('emW').value=c.smtp?.password||'';$('emR').value=(c.smtp?.recipients||[]).join(', ');
+$('whE').checked=c.webhook?.enabled||false;$('whU').value=c.webhook?.url||'';$('whM').value=c.webhook?.method||'POST';
+}catch(e){toast('Failed to load config',false)}}
+
+function bC(){return{
+frigate:{url:$('fUrl').value,public_url:$('fPub').value},
+mqtt:{enabled:$('mqE').checked,server:$('mSrv').value,port:+$('mPort').value||1883,username:$('mUsr').value,password:$('mPwd').value,topic_prefix:$('mPfx').value||'frigate',client_id:'frigate-alerts'},
+cameras:cam,labels:lbl,
+zones:{allow:za,block:zb},
+cooldown:+$('cdSec').value||0,
+quiet_hours:{enabled:$('qhE').checked,start:$('qhS').value,end:$('qhEnd').value},
+history_retention_days:+$('retDays').value||30,
+gif_delay:+$('gDel').value||10,gif_retries:+$('gRet').value||3,gif_retry_interval:5,
+pushover:{enabled:$('poE').checked,token:$('poT').value,sound:$('poS').value,priority:0,recipients:poRec},
+discord:{enabled:$('dcE').checked,webhooks:dcWh},
+telegram:{enabled:$('tgE').checked,token:$('tgT').value,chat_id:$('tgC').value},
+ntfy:{enabled:$('ntE').checked,server:$('ntS').value,topic:$('ntT').value,token:$('ntK').value},
+gotify:{enabled:$('goE').checked,server:$('goS').value,token:$('goT').value},
+smtp:{enabled:$('emE').checked,server:$('emS').value,port:+$('emP').value||587,username:$('emU').value,password:$('emW').value,tls:true,from:$('emU').value,recipients:$('emR').value.split(',').map(s=>s.trim()).filter(Boolean)},
+webhook:{enabled:$('whE').checked,url:$('whU').value,method:$('whM').value}}}
+
+async function save(){try{const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(bC())});
+const d=await r.json();if(d.status==='ok')toast('Saved!');else toast('Error',false)}catch(e){toast('Error: '+e,false)}}
+
+async function test(){toast('Sending test...');try{const r=await fetch('/api/test',{method:'POST'});const d=await r.json();
+if(d.status==='ok')toast(`Test sent! ${d.camera} — ${d.label}`);else toast(d.message||'Failed',false)}catch(e){toast('Error: '+e,false)}}
+
+async function snooze(min){try{const r=await fetch('/api/snooze',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({minutes:min})});
+const d=await r.json();if(d.status==='ok')toast(`Snoozed for ${min} min`);cS()}catch(e){toast('Error: '+e,false)}}
+
+async function unsnooze(){try{await fetch('/api/snooze/cancel',{method:'POST'});toast('Snooze cancelled');cS()}catch(e){toast('Error: '+e,false)}}
+
+async function lH(){try{const r=await fetch('/api/history?limit=50');const rows=await r.json();
+if(!rows.length){$('hB').innerHTML='<tr><td colspan="7" class="emp">No notifications yet</td></tr>';return}
+$('hB').innerHTML=rows.map(r=>{const t=new Date(r.timestamp*1000).toLocaleString();
+return`<tr><td>${t}</td><td>${r.camera}</td><td>${r.label}</td><td>${r.zones||''}</td><td>${r.provider}</td><td>${r.recipient}</td><td><span class="bg ${r.status==='sent'?'bg-s':'bg-e'}">${r.status}</span></td></tr>`}).join('')}catch(e){}}
+
+async function cS(){try{const r=await fetch('/api/status');const s=await r.json();
+$('fd').className='dot '+(s.frigate_connected?'g':'r');$('fs').textContent=s.frigate_connected?'Connected':'Disconnected';
+$('pd').className='dot '+(s.poller_running?'g':'r');$('ps').textContent=s.poller_running?'Running':'Stopped';
+if(s.mqtt_enabled){$('mqttBadge').style.display='flex';$('md').className='dot '+(s.mqtt_connected?'g':'y');$('ms').textContent=s.mqtt_connected?'Connected':'Disconnected'}
+else{$('mqttBadge').style.display='none'}
+// Snooze
+if(s.snoozed){$('snzBar').style.display='flex';$('snzCancel').style.display='';updateSnoozeTimer(s.snooze_remaining)}
+else{$('snzBar').style.display='none';$('snzCancel').style.display='none'}
+// Quiet hours
+$('quietBadge').style.display=s.quiet_hours_active?'flex':'none';
+}catch(e){}}
+
+let snzInterval;
+function updateSnoozeTimer(secs){
+clearInterval(snzInterval);
+let rem=secs;
+const tick=()=>{if(rem<=0){$('snzBar').style.display='none';clearInterval(snzInterval);return}
+const m=Math.floor(rem/60),s=rem%60;$('snzTime').textContent=m+':'+(s<10?'0':'')+s;rem--};
+tick();snzInterval=setInterval(tick,1000)}
+
+// Enter key on chip inputs
+['cI','lI','zaI','zbI'].forEach(id=>$(id).onkeydown=e=>{
+if(e.key==='Enter'){e.preventDefault();
+const map={cI:'cam',lI:'lbl',zaI:'za',zbI:'zb'};aChip(map[id])}});
+
+lC();cS();setInterval(cS,10000);
+</script>
+</body>
+</html>

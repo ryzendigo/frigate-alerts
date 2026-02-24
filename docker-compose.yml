@@ -1,0 +1,12 @@
+services:
+  frigate-alerts:
+    container_name: frigate-alerts
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8085:8000"
+    volumes:
+      - ./config:/app/config
+    # If running alongside Frigate, add to the same network:
+    # networks:
+    #   - frigate-net
