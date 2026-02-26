@@ -1,4 +1,4 @@
-"""Pushover notification provider. Supports animated GIF, snooze actions, per-camera overrides."""
+"""Pushover notification provider. Supports animated GIF, snooze actions, per-camera overrides, silent follow-ups."""
 
 import logging
 import requests
@@ -9,7 +9,7 @@ PUSHOVER_API = "https://api.pushover.net/1/messages.json"
 
 
 def send_pushover(config, recipient, title, message, image_data, image_type="image/gif",
-                   url=None, video_url=None, snooze_url=None, camera_overrides=None):
+                   url=None, video_url=None, snooze_url=None, camera_overrides=None, silent=False):
     camera_overrides = camera_overrides or {}
 
     data = {
@@ -17,7 +17,7 @@ def send_pushover(config, recipient, title, message, image_data, image_type="ima
         "user": recipient["userkey"],
         "title": title,
         "message": message,
-        "sound": camera_overrides.get("sound", config.get("sound", "pushover")),
+        "sound": "none" if silent else camera_overrides.get("sound", config.get("sound", "pushover")),
         "priority": str(camera_overrides.get("priority", config.get("priority", 0))),
         "html": "1",
     }
@@ -36,8 +36,8 @@ def send_pushover(config, recipient, title, message, image_data, image_type="ima
     if video_url:
         data["message"] += f'\n\n<a href="{video_url}">Watch Video</a>'
 
-    # Snooze action link
-    if snooze_url:
+    # Snooze action link (skip on silent follow-ups to reduce clutter)
+    if snooze_url and not silent:
         data["message"] += f'\n<a href="{snooze_url}">Snooze 30 min</a>'
 
     # Attach image (GIF or snapshot - Pushover doesn't support video)
@@ -50,7 +50,7 @@ def send_pushover(config, recipient, title, message, image_data, image_type="ima
         resp = requests.post(PUSHOVER_API, data=data, files=files, timeout=30)
         name = recipient.get("name", recipient["userkey"][:8])
         if resp.status_code == 200:
-            log.info("Pushover sent to %s", name)
+            log.info("Pushover %s to %s", "update sent" if silent else "sent", name)
             return "sent"
         else:
             log.error("Pushover error for %s: %s %s", name, resp.status_code, resp.text)
