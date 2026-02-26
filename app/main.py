@@ -14,6 +14,8 @@ import json
 import logging
 import os
 import sqlite3
+import subprocess
+import tempfile
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -29,7 +31,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from .notifiers.pushover import send_pushover
-from .notifiers.discord import send_discord
+from .notifiers.discord import send_discord, update_discord
 from .notifiers.telegram import send_telegram
 from .notifiers.ntfy import send_ntfy
 from .notifiers.gotify import send_gotify
@@ -256,15 +258,91 @@ def build_message(camera, label_str, zone_str, review_id, event_id):
 # Media fetching (GIF, snapshot, or clip)
 # ---------------------------------------------------------------------------
 
-def fetch_media(event_id, retries=None, retry_interval=None):
-    """Fetch preferred media type for an event. Returns (data, mime_type, extension)."""
+def clip_to_gif(clip_data, max_duration=3, fps=6, width=240):
+    """Convert mp4 clip to a smooth GIF using ffmpeg."""
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as mp4:
+        mp4.write(clip_data)
+        mp4_path = mp4.name
+    gif_path = mp4_path.replace(".mp4", ".gif")
+    try:
+        cmd = [
+            "ffmpeg", "-y", "-i", mp4_path,
+            "-t", str(max_duration),
+            "-vf", f"fps={fps},scale={width}:-1:flags=lanczos,split[s0][s1];[s0]palettegen=max_colors=128[p];[s1][p]paletteuse=dither=bayer",
+            "-loop", "0",
+            gif_path,
+        ]
+        result = subprocess.run(cmd, capture_output=True, timeout=30)
+        if result.returncode == 0 and os.path.exists(gif_path):
+            with open(gif_path, "rb") as f:
+                gif_data = f.read()
+            if len(gif_data) > 100:
+                log.info("Generated GIF from clip (%d bytes, %dfps, %dpx wide)", len(gif_data), fps, width)
+                return gif_data
+        else:
+            log.warning("ffmpeg GIF conversion failed: %s", result.stderr[-200:] if result.stderr else "unknown")
+    except Exception as e:
+        log.warning("GIF conversion error: %s", e)
+    finally:
+        for p in (mp4_path, gif_path):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+    return None
+
+
+def fetch_snapshot(event_id):
+    """Fetch snapshot immediately. Always available as soon as event starts."""
+    frigate_url = config.get("frigate", {}).get("url", "http://frigate:5000")
+    try:
+        resp = requests.get(f"{frigate_url}/api/events/{event_id}/snapshot.jpg", timeout=10)
+        if resp.status_code == 200 and len(resp.content) > 100:
+            log.info("Fetched snapshot for %s (%d bytes)", event_id, len(resp.content))
+            return resp.content, "image/jpeg", "jpg"
+    except Exception as e:
+        log.error("Snapshot fetch failed: %s", e)
+    return None, None, None
+
+
+def fetch_gif(event_id, retries=None, retry_interval=None):
+    """Fetch GIF media for an event (clip→ffmpeg GIF, or preview.gif fallback)."""
     frigate_url = config.get("frigate", {}).get("url", "http://frigate:5000")
     retries = retries or config.get("gif_retries", 3)
     retry_interval = retry_interval or config.get("gif_retry_interval", 5)
+
+    # Generate a smooth GIF from the video clip via ffmpeg
+    for attempt in range(1, retries + 1):
+        try:
+            resp = requests.get(f"{frigate_url}/api/events/{event_id}/clip.mp4", timeout=60)
+            if resp.status_code == 200 and len(resp.content) > 1000:
+                gif_data = clip_to_gif(resp.content)
+                if gif_data:
+                    return gif_data, "image/gif", "gif"
+            log.warning("Clip not ready for %s (attempt %d/%d)", event_id, attempt, retries)
+        except Exception as e:
+            log.warning("Clip fetch error: %s", e)
+        if attempt < retries:
+            time.sleep(retry_interval)
+
+    # Fallback to Frigate's preview.gif if clip unavailable
+    try:
+        resp = requests.get(f"{frigate_url}/api/events/{event_id}/preview.gif", timeout=30)
+        if resp.status_code == 200 and len(resp.content) > 100:
+            log.info("Fell back to Frigate preview.gif for %s (%d bytes)", event_id, len(resp.content))
+            return resp.content, "image/gif", "gif"
+    except Exception as e:
+        log.warning("Preview GIF fallback error: %s", e)
+
+    return None, None, None
+
+
+def fetch_media(event_id, retries=None, retry_interval=None):
+    """Fetch preferred media type for an event. Returns (data, mime_type, extension)."""
     media_type = config.get("media_type", "gif")
 
     if media_type == "clip":
-        # Try video clip first
+        frigate_url = config.get("frigate", {}).get("url", "http://frigate:5000")
         try:
             resp = requests.get(f"{frigate_url}/api/events/{event_id}/clip.mp4", timeout=60)
             if resp.status_code == 200 and len(resp.content) > 1000:
@@ -272,31 +350,17 @@ def fetch_media(event_id, retries=None, retry_interval=None):
                 return resp.content, "video/mp4", "mp4"
         except Exception as e:
             log.warning("Clip fetch error: %s", e)
-        # Fall through to GIF
 
     if media_type in ("gif", "clip"):
-        url = f"{frigate_url}/api/events/{event_id}/preview.gif"
-        for attempt in range(1, retries + 1):
-            try:
-                resp = requests.get(url, timeout=30)
-                if resp.status_code == 200 and len(resp.content) > 100:
-                    log.info("Fetched GIF for %s (%d bytes)", event_id, len(resp.content))
-                    return resp.content, "image/gif", "gif"
-                log.warning("GIF not ready for %s (attempt %d/%d)", event_id, attempt, retries)
-            except Exception as e:
-                log.warning("GIF fetch error: %s", e)
-            if attempt < retries:
-                time.sleep(retry_interval)
+        data, mime, ext = fetch_gif(event_id, retries, retry_interval)
+        if data:
+            return data, mime, ext
 
-    # Snapshot (either preferred or fallback)
-    try:
-        resp = requests.get(f"{frigate_url}/api/events/{event_id}/snapshot.jpg", timeout=30)
-        if resp.status_code == 200:
-            log.info("Fetched snapshot for %s", event_id)
-            return resp.content, "image/jpeg", "jpg"
-    except Exception as e:
-        log.error("Snapshot fetch failed: %s", e)
-    return None, None, None
+    if media_type == "snapshot":
+        return fetch_snapshot(event_id)
+
+    # Final fallback to snapshot
+    return fetch_snapshot(event_id)
 
 
 # ---------------------------------------------------------------------------
@@ -329,18 +393,20 @@ def build_snooze_url(minutes):
 def send_to_all_providers(title, message, media_data, media_type, media_ext,
                           frigate_url, video_url, review_id, event_id,
                           camera, label_str, zone_str):
+    """Send notification to all enabled providers. Returns message references for later updates."""
     snooze_url = build_snooze_url(30)
     media_size = len(media_data) if media_data else 0
+    msg_refs = {}
 
     po = config.get("pushover", {})
     if po.get("enabled"):
-        # Per-camera overrides
         cam_overrides = {}
         for co in po.get("camera_overrides", []):
             if co.get("camera") == camera:
                 cam_overrides = co
                 break
 
+        po_refs = []
         for r in po.get("recipients", []):
             status = send_pushover(
                 po, r, title, message, media_data, media_type,
@@ -348,16 +414,22 @@ def send_to_all_providers(title, message, media_data, media_type, media_ext,
                 camera_overrides=cam_overrides,
             )
             log_notification(review_id, event_id, camera, label_str, zone_str, "pushover", r.get("name", ""), status, gif_size=media_size)
+            po_refs.append({"config": po, "recipient": r, "camera_overrides": cam_overrides})
+        msg_refs["pushover"] = po_refs
 
     dc = config.get("discord", {})
     if dc.get("enabled"):
+        dc_refs = []
         for w in dc.get("webhooks", []):
-            status = send_discord(
+            status, message_id = send_discord(
                 w, title, message, media_data, media_type,
                 url=frigate_url, video_url=video_url,
                 camera=camera, label=label_str, zone=zone_str,
             )
             log_notification(review_id, event_id, camera, label_str, zone_str, "discord", w.get("name", ""), status, gif_size=media_size)
+            if message_id:
+                dc_refs.append({"webhook_url": w.get("url", ""), "message_id": message_id})
+        msg_refs["discord"] = dc_refs
 
     tg = config.get("telegram", {})
     if tg.get("enabled"):
@@ -384,6 +456,36 @@ def send_to_all_providers(title, message, media_data, media_type, media_ext,
         event_data = {"review_id": review_id, "event_id": event_id, "camera": camera, "label": label_str, "zones": zone_str, "video_url": video_url}
         status = send_webhook(wh, title, message, media_data, media_type, url=frigate_url, event_data=event_data)
         log_notification(review_id, event_id, camera, label_str, zone_str, "webhook", wh.get("url", "")[:30], status, gif_size=media_size)
+
+    return msg_refs
+
+
+def update_all_providers(msg_refs, title, message, media_data, media_type, media_ext,
+                          frigate_url, video_url, review_id, event_id,
+                          camera, label_str, zone_str):
+    """Update previously sent notifications with GIF media."""
+    media_size = len(media_data) if media_data else 0
+    snooze_url = build_snooze_url(30)
+
+    # Discord: edit the original message in-place
+    for ref in msg_refs.get("discord", []):
+        status = update_discord(
+            ref["webhook_url"], ref["message_id"],
+            title, message, media_data, media_type,
+            url=frigate_url, video_url=video_url,
+            camera=camera, label=label_str, zone=zone_str,
+        )
+        log_notification(review_id, event_id, camera, label_str, zone_str, "discord", "update", status, gif_size=media_size)
+
+    # Pushover: send a silent follow-up (no edit API)
+    for ref in msg_refs.get("pushover", []):
+        status = send_pushover(
+            ref["config"], ref["recipient"], title, message, media_data, media_type,
+            url=frigate_url, video_url=video_url, snooze_url=snooze_url,
+            camera_overrides=ref.get("camera_overrides", {}),
+            silent=True,
+        )
+        log_notification(review_id, event_id, camera, label_str, zone_str, "pushover", ref["recipient"].get("name", "") + " (gif)", status, gif_size=media_size)
 
 
 # ---------------------------------------------------------------------------
@@ -423,24 +525,53 @@ def process_review(review):
     set_cooldown(camera)
 
     event_id = detections[0]
-    gif_delay = config.get("gif_delay", 10)
-    log.info("Waiting %ds for media...", gif_delay)
-    time.sleep(gif_delay)
-
-    media_data, media_type, media_ext = fetch_media(event_id)
-    if not media_data:
-        return
-
     label_str = ", ".join(objects)
     zone_str = ", ".join(zones) if zones else ""
     title, message = build_message(camera, label_str, zone_str, review_id, event_id)
     frigate_url, video_url = build_event_urls(review_id, event_id)
 
-    send_to_all_providers(
-        title, message, media_data, media_type, media_ext,
+    # --- Phase 1: Instant snapshot notification ---
+    snap_data, snap_type, snap_ext = fetch_snapshot(event_id)
+    if not snap_data:
+        log.warning("No snapshot available for %s, waiting for GIF instead", event_id)
+        # Fall back to old behavior if snapshot somehow unavailable
+        gif_delay = config.get("gif_delay", 10)
+        time.sleep(gif_delay)
+        media_data, media_type, media_ext = fetch_media(event_id)
+        if media_data:
+            send_to_all_providers(
+                title, message, media_data, media_type, media_ext,
+                frigate_url, video_url, review_id, event_id,
+                camera, label_str, zone_str,
+            )
+        return
+
+    log.info("Phase 1: Sending instant snapshot for %s", event_id)
+    msg_refs = send_to_all_providers(
+        title, message, snap_data, snap_type, snap_ext,
         frigate_url, video_url, review_id, event_id,
         camera, label_str, zone_str,
     )
+
+    # --- Phase 2: GIF upgrade ---
+    media_type_cfg = config.get("media_type", "gif")
+    if media_type_cfg == "snapshot":
+        return  # User only wants snapshots, we're done
+
+    gif_delay = config.get("gif_delay", 5)
+    log.info("Phase 2: Waiting %ds for GIF...", gif_delay)
+    time.sleep(gif_delay)
+
+    gif_data, gif_type, gif_ext = fetch_gif(event_id)
+    if gif_data:
+        log.info("Phase 2: Updating notifications with GIF for %s (%d bytes)", event_id, len(gif_data))
+        update_all_providers(
+            msg_refs, title, message, gif_data, gif_type, gif_ext,
+            frigate_url, video_url, review_id, event_id,
+            camera, label_str, zone_str,
+        )
+    else:
+        log.info("Phase 2: No GIF available for %s, snapshot notification stands", event_id)
 
 
 # ---------------------------------------------------------------------------
@@ -452,21 +583,19 @@ def poll_frigate():
     poller_running = True
     frigate_url = config.get("frigate", {}).get("url", "http://frigate:5000")
     poll_interval = config.get("poll_interval", 10)
-    last_check = time.time()
+    lookback = 300  # always check last 5 minutes, dedup handles the rest
 
     log.info("API poller started (interval=%ds, url=%s)", poll_interval, frigate_url)
 
     while poller_running:
         try:
-            params = {"severity": "alert", "after": last_check - 5, "limit": 20}
-            resp = requests.get(f"{frigate_url}/api/reviews", params=params, timeout=15)
+            params = {"severity": "alert", "after": time.time() - lookback, "limit": 50}
+            resp = requests.get(f"{frigate_url}/api/review", params=params, timeout=15)
             if resp.status_code == 200:
                 reviews = resp.json()
-                now = time.time()
                 for review in reviews:
                     if review.get("end_time") and review.get("severity") == "alert":
                         threading.Thread(target=process_review, args=(review,), daemon=True).start()
-                last_check = now
         except Exception as e:
             log.warning("API poll error: %s", e)
         time.sleep(poll_interval)

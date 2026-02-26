@@ -7,6 +7,11 @@ services:
       - "8085:8000"
     volumes:
       - ./config:/app/config
-    # If running alongside Frigate, add to the same network:
-    # networks:
-    #   - frigate-net
+    networks:
+      - default
+      - frigate-net
+
+networks:
+  frigate-net:
+    external: true
+    name: frigate-notify-doubletake_frigate-net
