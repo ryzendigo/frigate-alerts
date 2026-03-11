@@ -3,7 +3,7 @@
 import json
 import logging
 import requests
-from datetime import datetime
+from datetime import datetime, timezone
 
 log = logging.getLogger("frigate-alerts")
 
@@ -24,7 +24,7 @@ def send_discord(webhook_config, title, message, image_data, image_type="image/g
         "title": title,
         "description": message,
         "color": EMBED_COLOR,
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "fields": [],
     }
 
@@ -56,24 +56,29 @@ def send_discord(webhook_config, title, message, image_data, image_type="image/g
     if image_data:
         files["file"] = (f"preview.{ext}", image_data, image_type)
 
-    try:
-        # Use ?wait=true to get the message object back (includes message ID for later editing)
+    # Use ?wait=true to get the message object back (includes message ID for later editing)
+    resp = requests.post(f"{webhook_url}?wait=true", files=files, timeout=30)
+    name = webhook_config.get("name", "webhook")
+
+    # Handle Discord rate limiting
+    if resp.status_code == 429:
+        retry_after = resp.json().get("retry_after", 1)
+        log.warning("Discord rate limited for %s, retry_after=%.1fs", name, retry_after)
+        import time
+        time.sleep(min(retry_after, 5))
         resp = requests.post(f"{webhook_url}?wait=true", files=files, timeout=30)
-        name = webhook_config.get("name", "webhook")
-        if resp.status_code in (200, 204):
-            message_id = None
-            try:
-                message_id = resp.json().get("id")
-            except Exception:
-                pass
-            log.info("Discord sent to %s (msg_id=%s)", name, message_id)
-            return "sent", message_id
-        else:
-            log.error("Discord error for %s: %s %s", name, resp.status_code, resp.text)
-            return f"error: {resp.status_code}", None
-    except Exception as e:
-        log.error("Discord exception: %s", e)
-        return f"error: {e}", None
+
+    if resp.status_code in (200, 204):
+        message_id = None
+        try:
+            message_id = resp.json().get("id")
+        except Exception:
+            pass
+        log.info("Discord sent to %s (msg_id=%s)", name, message_id)
+        return "sent", message_id
+    else:
+        log.error("Discord error for %s: %s %s", name, resp.status_code, resp.text[:200])
+        return f"error: {resp.status_code}", None
 
 
 def update_discord(webhook_url, message_id, title, message, image_data, image_type="image/gif",
@@ -88,7 +93,7 @@ def update_discord(webhook_url, message_id, title, message, image_data, image_ty
         "title": title,
         "description": message,
         "color": EMBED_COLOR,
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "fields": [],
     }
 
@@ -118,15 +123,20 @@ def update_discord(webhook_url, message_id, title, message, image_data, image_ty
     if image_data:
         files["file"] = (f"preview.{ext}", image_data, image_type)
 
-    try:
-        patch_url = f"{webhook_url}/messages/{message_id}"
+    patch_url = f"{webhook_url}/messages/{message_id}"
+    resp = requests.patch(patch_url, files=files, timeout=30)
+
+    # Handle Discord rate limiting
+    if resp.status_code == 429:
+        retry_after = resp.json().get("retry_after", 1)
+        log.warning("Discord rate limited on edit, retry_after=%.1fs", retry_after)
+        import time
+        time.sleep(min(retry_after, 5))
         resp = requests.patch(patch_url, files=files, timeout=30)
-        if resp.status_code in (200, 204):
-            log.info("Discord message %s updated with GIF", message_id)
-            return "updated"
-        else:
-            log.error("Discord edit error: %s %s", resp.status_code, resp.text)
-            return f"error: {resp.status_code}"
-    except Exception as e:
-        log.error("Discord edit exception: %s", e)
-        return f"error: {e}"
+
+    if resp.status_code in (200, 204):
+        log.info("Discord message %s updated with GIF", message_id)
+        return "updated"
+    else:
+        log.error("Discord edit error: %s %s", resp.status_code, resp.text[:200])
+        return f"error: {resp.status_code}"
