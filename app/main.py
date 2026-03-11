@@ -1,5 +1,5 @@
 """
-Frigate Alerts - Main Application (v2.2 - Hardened for reliability)
+Frigate Alerts - Main Application (v2.3 - Hardened for reliability)
 Animated GIF notifications from Frigate NVR events.
 Supports: Pushover, Discord, Telegram, Ntfy, Gotify, Email, Webhook
 
@@ -11,20 +11,20 @@ Architecture:
       Phase 1: Instant snapshot on event creation (<2s target)
       Phase 2: GIF upgrade when event ends (or after timeout)
   - Event queue with SQLite persistence for guaranteed delivery
-  - Parallel provider dispatch with ThreadPoolExecutor
+  - Separate thread pools: event_pool (processing) + provider_pool (dispatch)
   - Auto-reconnecting MQTT with exponential backoff
-  - Provider-level retry with exponential backoff for transient failures
+  - Provider-level retry with return-value inspection for transient failures
 """
 
 import json
 import logging
 import os
-import signal
 import sqlite3
 import subprocess
 import tempfile
 import threading
 import time
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
@@ -61,10 +61,10 @@ mqtt_connected = False
 poller_running = False
 shutting_down = threading.Event()
 
-# Thread-safe dedup
+# Thread-safe dedup using OrderedDict for recency-based trimming
 _dedup_lock = threading.Lock()
-notified_reviews = set()  # Reviews we actually sent notifications for
-seen_reviews = set()       # Reviews we've seen (sent OR filtered) - prevents repeat log spam
+notified_reviews = OrderedDict()  # review_id -> timestamp (reviews we sent notifications for)
+seen_reviews = OrderedDict()       # review_id -> timestamp (reviews we've seen but filtered)
 
 # Phase 2 tracking: review_id -> {msg_refs, title, message, ...}
 _phase2_lock = threading.Lock()
@@ -80,16 +80,15 @@ stats = {"phase1_sent": 0, "phase2_sent": 0, "events_received": 0, "events_skipp
 # Snooze: timestamp when snooze expires (0 = not snoozed)
 snooze_until = 0
 
-# Worker pool for both event processing and provider dispatch
-# Event processing threads: ~5 concurrent max (poller batch + MQTT)
-# Provider dispatch threads: ~7 per event (one per provider)
-# Phase 2 threads: ~3 concurrent max
-# Total realistic max: ~15-20 concurrent, pool of 16 is safe
-worker_pool = ThreadPoolExecutor(max_workers=16, thread_name_prefix="worker")
+# SEPARATE worker pools to prevent deadlock:
+# event_pool: processes events (Phase 1 + Phase 2). Each event blocks waiting for providers.
+# provider_pool: dispatches to notification providers. Never blocks on event_pool.
+# This prevents the scenario where all event workers wait for provider workers that can't start.
+event_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="event")
+provider_pool = ThreadPoolExecutor(max_workers=16, thread_name_prefix="provider")
 
-# Reusable HTTP session for Frigate API (connection pooling)
-_http_session = None
-_http_lock = threading.Lock()
+# Thread-local HTTP sessions (requests.Session is NOT thread-safe)
+_thread_local = threading.local()
 
 # Poller error suppression
 _last_poll_error = ""
@@ -97,19 +96,16 @@ _poll_error_count = 0
 
 
 def _get_session():
-    """Get or create a reusable requests.Session with connection pooling."""
-    global _http_session
-    if _http_session is None:
-        with _http_lock:
-            if _http_session is None:
-                s = requests.Session()
-                adapter = requests.adapters.HTTPAdapter(
-                    pool_connections=4, pool_maxsize=8, max_retries=0
-                )
-                s.mount("http://", adapter)
-                s.mount("https://", adapter)
-                _http_session = s
-    return _http_session
+    """Get a thread-local requests.Session with connection pooling."""
+    if not hasattr(_thread_local, "session") or _thread_local.session is None:
+        s = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=4, pool_maxsize=8, max_retries=0
+        )
+        s.mount("http://", adapter)
+        s.mount("https://", adapter)
+        _thread_local.session = s
+    return _thread_local.session
 
 
 def _inc_stat(key, value=1):
@@ -118,13 +114,13 @@ def _inc_stat(key, value=1):
 
 
 def _add_to_seen(review_id):
-    """Track a review as seen (filtered/stale). Trims to prevent unbounded growth."""
+    """Track a review as seen (filtered/stale). Trims oldest entries when full."""
     with _dedup_lock:
-        seen_reviews.add(review_id)
+        seen_reviews[review_id] = time.time()
         if len(seen_reviews) > 3000:
-            trimmed = sorted(seen_reviews)[-2000:]
-            seen_reviews.clear()
-            seen_reviews.update(trimmed)
+            # Remove oldest 1000 entries (OrderedDict preserves insertion order)
+            for _ in range(1000):
+                seen_reviews.popitem(last=False)
 
 
 def load_config():
@@ -137,6 +133,7 @@ def load_config():
             config = {}
         else:
             config = loaded
+        _validate_config()
     except FileNotFoundError:
         log.error("Config file not found: %s, using defaults", CONFIG_PATH)
         config = {}
@@ -144,6 +141,29 @@ def load_config():
         log.error("Config file has invalid YAML: %s, using defaults", e)
         config = {}
     return config
+
+
+def _validate_config():
+    """Log warnings for missing or invalid config values."""
+    if not config.get("frigate", {}).get("url"):
+        log.warning("Config: frigate.url not set, using default http://frigate:5000")
+    cameras = config.get("cameras", [])
+    if not cameras:
+        log.warning("Config: no cameras configured — will process ALL cameras")
+    labels = config.get("labels", [])
+    if not labels:
+        log.warning("Config: no labels configured — will process ALL labels")
+    if not isinstance(cameras, list):
+        log.error("Config: 'cameras' should be a list, got %s", type(cameras).__name__)
+        config["cameras"] = []
+    if not isinstance(labels, list):
+        log.error("Config: 'labels' should be a list, got %s", type(labels).__name__)
+        config["labels"] = []
+    # Ensure zones has correct structure
+    zones = config.get("zones", {})
+    if not isinstance(zones, dict):
+        log.error("Config: 'zones' should be a dict, got %s — resetting", type(zones).__name__)
+        config["zones"] = {}
 
 
 def save_config(new_config):
@@ -174,6 +194,13 @@ def get_db():
 def init_db():
     with get_db() as conn:
         conn.execute("PRAGMA journal_mode=WAL")
+        # Quick integrity check on startup
+        try:
+            result = conn.execute("PRAGMA quick_check").fetchone()
+            if result and result[0] != "ok":
+                log.error("Database integrity check failed: %s", result[0])
+        except Exception as e:
+            log.error("Database integrity check error: %s", e)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -295,13 +322,11 @@ def run_cleanup_loop():
         cleanup_history()
         with _dedup_lock:
             if len(notified_reviews) > 2000:
-                trimmed = sorted(notified_reviews)[-1000:]
-                notified_reviews.clear()
-                notified_reviews.update(trimmed)
+                for _ in range(1000):
+                    notified_reviews.popitem(last=False)
             if len(seen_reviews) > 3000:
-                trimmed = sorted(seen_reviews)[-2000:]
-                seen_reviews.clear()
-                seen_reviews.update(trimmed)
+                for _ in range(1000):
+                    seen_reviews.popitem(last=False)
         with _phase2_lock:
             stale = [rid for rid, ctx in pending_phase2.items()
                      if time.time() - ctx.get("created_at", 0) > 600]
@@ -538,26 +563,6 @@ def fetch_gif(event_id, retries=None, retry_interval=None):
     return None, None, None
 
 
-def fetch_media(event_id, retries=None, retry_interval=None):
-    media_type = config.get("media_type", "gif")
-    if media_type == "clip":
-        frigate_url = config.get("frigate", {}).get("url", "http://frigate:5000")
-        session = _get_session()
-        try:
-            resp = session.get(f"{frigate_url}/api/events/{event_id}/clip.mp4", timeout=30)
-            if resp.status_code == 200 and len(resp.content) > 1000:
-                return resp.content, "video/mp4", "mp4"
-        except Exception as e:
-            log.warning("Clip fetch error: %s", e)
-    if media_type in ("gif", "clip"):
-        data, mime, ext = fetch_gif(event_id, retries, retry_interval)
-        if data:
-            return data, mime, ext
-    if media_type == "snapshot":
-        return fetch_snapshot(event_id)
-    return fetch_snapshot(event_id)
-
-
 # ---------------------------------------------------------------------------
 # URL builders
 # ---------------------------------------------------------------------------
@@ -581,40 +586,71 @@ def build_snooze_url(minutes):
 # Provider retry wrapper
 # ---------------------------------------------------------------------------
 
+def _is_error_result(result):
+    """Check if a provider return value indicates a transient error worth retrying."""
+    if isinstance(result, str):
+        return result.startswith("error:")
+    if isinstance(result, tuple) and result:
+        return isinstance(result[0], str) and result[0].startswith("error:")
+    return False
+
+
 def _retry_provider(func, provider_name, max_retries=2):
-    """Retry a provider send function on transient failures (429, 5xx, connection errors).
-    Returns the function's return value on success, or re-raises on permanent failure."""
-    last_exc = None
+    """Retry a provider send function on transient failures.
+    Handles both raised exceptions AND error return values from notifiers
+    that catch exceptions internally (e.g., pushover, discord)."""
+    last_error = None
     for attempt in range(max_retries + 1):
         try:
-            return func()
+            result = func()
+            # Check if the notifier returned an error string instead of raising
+            if _is_error_result(result):
+                last_error = result
+                if attempt < max_retries:
+                    delay = 1 * (2 ** attempt)
+                    log.warning("%s returned error (attempt %d/%d): %s, retrying in %ds",
+                               provider_name, attempt + 1, max_retries + 1, result, delay)
+                    time.sleep(delay)
+                    continue
+                else:
+                    log.warning("%s returned error after %d attempts: %s",
+                               provider_name, max_retries + 1, result)
+                    return result
+            return result
         except requests.exceptions.ConnectionError as e:
-            last_exc = e
+            last_error = e
             if attempt < max_retries:
                 delay = 1 * (2 ** attempt)
                 log.warning("%s connection error (attempt %d/%d), retrying in %ds",
                            provider_name, attempt + 1, max_retries + 1, delay)
                 time.sleep(delay)
+            else:
+                raise
         except requests.exceptions.Timeout as e:
-            last_exc = e
+            last_error = e
             if attempt < max_retries:
                 log.warning("%s timeout (attempt %d/%d), retrying",
                            provider_name, attempt + 1, max_retries + 1)
                 time.sleep(1)
-        except Exception as e:
+            else:
+                raise
+        except Exception:
             raise  # Non-transient errors propagate immediately
-    if last_exc:
-        raise last_exc
+    # Should not reach here, but safety net
+    if isinstance(last_error, Exception):
+        raise last_error
+    return last_error
 
 
 # ---------------------------------------------------------------------------
-# Notification dispatch (parallel)
+# Notification dispatch (parallel via provider_pool)
 # ---------------------------------------------------------------------------
 
 def send_to_all_providers(title, message, media_data, media_type, media_ext,
                           frigate_url, video_url, review_id, event_id,
                           camera, label_str, zone_str):
-    """Send notification to all enabled providers IN PARALLEL. Returns message references."""
+    """Send notification to all enabled providers IN PARALLEL using provider_pool.
+    Returns message references for Phase 2 updates."""
     snooze_url = build_snooze_url(30)
     media_size = len(media_data) if media_data else 0
     msg_refs = {}
@@ -661,7 +697,10 @@ def send_to_all_providers(title, message, media_data, media_type, media_ext,
                         camera=camera, label=label_str, zone=zone_str,
                     )
                 result = _retry_provider(_do_send, f"Discord/{w.get('name', '?')}")
-                status, message_id = result
+                if isinstance(result, tuple):
+                    status, message_id = result
+                else:
+                    status, message_id = result, None
                 log_notification(review_id, event_id, camera, label_str, zone_str, "discord", w.get("name", ""), status, gif_size=media_size)
                 if message_id:
                     dc_refs.append({"webhook_url": w.get("url", ""), "message_id": message_id})
@@ -737,11 +776,11 @@ def send_to_all_providers(title, message, media_data, media_type, media_ext,
             log.error("Webhook send error: %s", e)
             _inc_stat("errors")
 
-    # Fire all providers in parallel using the bounded worker pool
+    # Fire all providers in parallel using the PROVIDER pool (not event pool!)
     senders = [_send_pushover_all, _send_discord_all, _send_telegram, _send_ntfy, _send_gotify, _send_smtp, _send_webhook]
     send_futures = []
     for sender in senders:
-        send_futures.append(worker_pool.submit(sender))
+        send_futures.append(provider_pool.submit(sender))
 
     # Wait for all to complete (max 45s to account for provider retries)
     try:
@@ -761,7 +800,7 @@ def send_to_all_providers(title, message, media_data, media_type, media_ext,
 def update_all_providers(msg_refs, title, message, media_data, media_type, media_ext,
                           frigate_url, video_url, review_id, event_id,
                           camera, label_str, zone_str):
-    """Update previously sent notifications with GIF media (parallel)."""
+    """Update previously sent notifications with GIF media (parallel via provider_pool)."""
     media_size = len(media_data) if media_data else 0
     snooze_url = build_snooze_url(30)
     futures = []
@@ -796,8 +835,8 @@ def update_all_providers(msg_refs, title, message, media_data, media_type, media
             except Exception as e:
                 log.error("Pushover update error: %s", e)
 
-    futures.append(worker_pool.submit(_update_discord))
-    futures.append(worker_pool.submit(_update_pushover))
+    futures.append(provider_pool.submit(_update_discord))
+    futures.append(provider_pool.submit(_update_pushover))
 
     try:
         for f in as_completed(futures, timeout=45):
@@ -818,7 +857,7 @@ def _add_to_dedup(review_id):
     with _dedup_lock:
         if review_id in notified_reviews:
             return False
-        notified_reviews.add(review_id)
+        notified_reviews[review_id] = time.time()
         return True
 
 
@@ -884,6 +923,9 @@ def process_phase1(review):
     if not snap_data:
         log.warning("No snapshot for %s, saving as pending", event_id)
         save_pending_event(review_id, review, "phase1")
+        # Allow retry by removing from dedup
+        with _dedup_lock:
+            notified_reviews.pop(review_id, None)
         return
 
     t_start = time.time()
@@ -982,7 +1024,6 @@ def phase2_timeout_loop():
                 event_id = ctx["event_id"]
 
                 if already_retried:
-                    # Already failed once via process_phase2, this is the final attempt
                     log.info("Phase 2 final timeout for %s, last GIF attempt", rid)
                 else:
                     log.info("Phase 2 timeout for %s, attempting GIF", rid)
@@ -1026,8 +1067,8 @@ def pending_retry_loop():
                     event_data = json.loads(row["event_data"])
                     log.info("Retrying pending event %s (attempt %d)", review_id, row["attempts"] + 1)
                     with _dedup_lock:
-                        notified_reviews.discard(review_id)
-                        seen_reviews.discard(review_id)
+                        notified_reviews.pop(review_id, None)
+                        seen_reviews.pop(review_id, None)
                     process_phase1(event_data)
                 except json.JSONDecodeError:
                     log.error("Pending event %s has corrupt JSON, removing", review_id)
@@ -1057,6 +1098,13 @@ def poll_frigate():
 
     log.info("API poller started (interval=%ds, url=%s)", poll_interval, frigate_url)
 
+    # Grace period on startup: wait a few seconds for MQTT to connect first
+    # This avoids double-processing the initial batch of events
+    for _ in range(3):
+        if shutting_down.is_set():
+            return
+        time.sleep(1)
+
     while poller_running and not shutting_down.is_set():
         try:
             params = {"severity": "alert", "after": time.time() - lookback, "limit": 50}
@@ -1072,12 +1120,12 @@ def poll_frigate():
                         with _dedup_lock:
                             already_handled = review_id in notified_reviews or review_id in seen_reviews
                         if not already_handled:
-                            worker_pool.submit(process_phase1, review)
+                            event_pool.submit(process_phase1, review)
                         if review.get("end_time"):
                             with _phase2_lock:
                                 has_pending = review_id in pending_phase2
                             if has_pending:
-                                worker_pool.submit(process_phase2, review_id)
+                                event_pool.submit(process_phase2, review_id)
             else:
                 _handle_poll_error(f"HTTP {resp.status_code}")
         except requests.exceptions.ConnectionError:
@@ -1151,7 +1199,7 @@ def on_message(client, userdata, msg):
             return
 
         if msg_type == "new":
-            worker_pool.submit(process_phase1, review)
+            event_pool.submit(process_phase1, review)
 
         elif msg_type == "update":
             review_id = review.get("id", "")
@@ -1163,14 +1211,14 @@ def on_message(client, userdata, msg):
                 zones = review.get("data", {}).get("zones", [])
                 if should_notify(camera, objects, zones):
                     with _dedup_lock:
-                        seen_reviews.discard(review_id)
+                        seen_reviews.pop(review_id, None)
                     log.info("Update promoted to Phase 1: %s camera=%s objects=%s", review_id, camera, objects)
-                    worker_pool.submit(process_phase1, review)
+                    event_pool.submit(process_phase1, review)
 
         elif msg_type == "end":
             review_id = review.get("id", "")
             if review_id:
-                worker_pool.submit(process_phase2, review_id)
+                event_pool.submit(process_phase2, review_id)
 
     except json.JSONDecodeError:
         log.warning("MQTT: received invalid JSON")
@@ -1324,21 +1372,19 @@ async def lifespan(app: FastAPI):
     # Start cleanup loop
     threading.Thread(target=run_cleanup_loop, daemon=True).start()
 
-    log.info("Frigate Alerts v2.2 started (MQTT=%s, poll=%ds)",
+    log.info("Frigate Alerts v2.3 started (MQTT=%s, poll=%ds, event_pool=%d, provider_pool=%d)",
              "enabled" if mqtt_conf.get("enabled") and mqtt_conf.get("server") else "disabled",
-             config.get("poll_interval", 5))
+             config.get("poll_interval", 5),
+             event_pool._max_workers,
+             provider_pool._max_workers)
     yield
 
     # Graceful shutdown
     shutting_down.set()
     stop_poller()
     stop_mqtt()
-    worker_pool.shutdown(wait=True, cancel_futures=True)
-    if _http_session:
-        try:
-            _http_session.close()
-        except Exception:
-            pass
+    event_pool.shutdown(wait=True, cancel_futures=True)
+    provider_pool.shutdown(wait=True, cancel_futures=True)
     log.info("Frigate Alerts shut down")
 
 
@@ -1484,13 +1530,45 @@ async def test_notification():
         else:
             log.info("Test Phase 2: No GIF available, snapshot stands")
 
-    worker_pool.submit(_run_test)
+    event_pool.submit(_run_test)
     return {"status": "ok", "camera": event["camera"], "label": event["label"]}
 
 
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "uptime": time.time()}
+    """Health check — verifies core subsystems are alive."""
+    healthy = True
+    details = {}
+
+    # Check event pool
+    try:
+        # Submit a no-op to verify pool is accepting work
+        f = event_pool.submit(lambda: True)
+        f.result(timeout=2)
+        details["event_pool"] = "ok"
+    except Exception:
+        details["event_pool"] = "unhealthy"
+        healthy = False
+
+    # Check provider pool
+    try:
+        f = provider_pool.submit(lambda: True)
+        f.result(timeout=2)
+        details["provider_pool"] = "ok"
+    except Exception:
+        details["provider_pool"] = "unhealthy"
+        healthy = False
+
+    # MQTT status (if enabled)
+    mqtt_conf = config.get("mqtt", {})
+    if mqtt_conf.get("enabled") and mqtt_conf.get("server"):
+        details["mqtt"] = "connected" if mqtt_connected else "disconnected"
+
+    details["poller"] = "running" if poller_running else "stopped"
+
+    status_code = 200 if healthy else 503
+    from fastapi.responses import JSONResponse
+    return JSONResponse({"status": "ok" if healthy else "unhealthy", **details}, status_code=status_code)
 
 
 if __name__ == "__main__":
