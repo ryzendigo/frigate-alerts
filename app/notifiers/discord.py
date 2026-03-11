@@ -11,15 +11,8 @@ log = logging.getLogger("frigate-alerts")
 EMBED_COLOR = 0x3B82F6
 
 
-def send_discord(webhook_config, title, message, image_data, image_type="image/gif",
-                  url=None, video_url=None, camera="", label="", zone=""):
-    webhook_url = webhook_config.get("url", "")
-    if not webhook_url:
-        return "error: no webhook URL", None
-
-    ext = "gif" if "gif" in (image_type or "") else ("mp4" if "video" in (image_type or "") else "jpg")
-
-    # Build rich embed
+def _build_embed(title, message, camera, label, zone, url, video_url, ext):
+    """Build a Discord rich embed dict."""
     embed = {
         "title": title,
         "description": message,
@@ -35,7 +28,6 @@ def send_discord(webhook_config, title, message, image_data, image_type="image/g
     if zone:
         embed["fields"].append({"name": "Zone", "value": zone, "inline": True})
 
-    # Links
     links = []
     if url:
         links.append(f"[View in Frigate]({url})")
@@ -44,10 +36,40 @@ def send_discord(webhook_config, title, message, image_data, image_type="image/g
     if links:
         embed["description"] += "\n\n" + " | ".join(links)
 
-    # For images, attach as embed image
     if ext in ("gif", "jpg"):
         embed["image"] = {"url": f"attachment://preview.{ext}"}
 
+    return embed
+
+
+def _get_ext(image_type):
+    """Determine file extension from MIME type."""
+    return "gif" if "gif" in (image_type or "") else ("mp4" if "video" in (image_type or "") else "jpg")
+
+
+def _handle_rate_limit(resp, retry_func, name, session=None):
+    """Handle Discord 429 rate limiting with a single retry."""
+    if resp.status_code == 429:
+        try:
+            retry_after = resp.json().get("retry_after", 1)
+        except Exception:
+            retry_after = 1
+        log.warning("Discord rate limited for %s, retry_after=%.1fs", name, retry_after)
+        import time
+        time.sleep(min(retry_after, 5))
+        return retry_func()
+    return resp
+
+
+def send_discord(webhook_config, title, message, image_data, image_type="image/gif",
+                  url=None, video_url=None, camera="", label="", zone="",
+                  session=None):
+    webhook_url = webhook_config.get("url", "")
+    if not webhook_url:
+        return "error: no webhook URL", None
+
+    ext = _get_ext(image_type)
+    embed = _build_embed(title, message, camera, label, zone, url, video_url, ext)
     payload = {"embeds": [embed]}
 
     files = {
@@ -56,17 +78,16 @@ def send_discord(webhook_config, title, message, image_data, image_type="image/g
     if image_data:
         files["file"] = (f"preview.{ext}", image_data, image_type)
 
-    # Use ?wait=true to get the message object back (includes message ID for later editing)
-    resp = requests.post(f"{webhook_url}?wait=true", files=files, timeout=30)
+    _post = session.post if session else requests.post
     name = webhook_config.get("name", "webhook")
 
+    # Use ?wait=true to get the message object back (includes message ID for later editing)
+    resp = _post(f"{webhook_url}?wait=true", files=files, timeout=15)
+
     # Handle Discord rate limiting
-    if resp.status_code == 429:
-        retry_after = resp.json().get("retry_after", 1)
-        log.warning("Discord rate limited for %s, retry_after=%.1fs", name, retry_after)
-        import time
-        time.sleep(min(retry_after, 5))
-        resp = requests.post(f"{webhook_url}?wait=true", files=files, timeout=30)
+    def _retry():
+        return _post(f"{webhook_url}?wait=true", files=files, timeout=15)
+    resp = _handle_rate_limit(resp, _retry, name, session)
 
     if resp.status_code in (200, 204):
         message_id = None
@@ -82,39 +103,14 @@ def send_discord(webhook_config, title, message, image_data, image_type="image/g
 
 
 def update_discord(webhook_url, message_id, title, message, image_data, image_type="image/gif",
-                    url=None, video_url=None, camera="", label="", zone=""):
+                    url=None, video_url=None, camera="", label="", zone="",
+                    session=None):
     """Edit an existing Discord webhook message to replace the image with a GIF."""
     if not webhook_url or not message_id:
         return "error: missing webhook URL or message ID"
 
-    ext = "gif" if "gif" in (image_type or "") else ("mp4" if "video" in (image_type or "") else "jpg")
-
-    embed = {
-        "title": title,
-        "description": message,
-        "color": EMBED_COLOR,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "fields": [],
-    }
-
-    if camera:
-        embed["fields"].append({"name": "Camera", "value": camera, "inline": True})
-    if label:
-        embed["fields"].append({"name": "Label", "value": label.title(), "inline": True})
-    if zone:
-        embed["fields"].append({"name": "Zone", "value": zone, "inline": True})
-
-    links = []
-    if url:
-        links.append(f"[View in Frigate]({url})")
-    if video_url:
-        links.append(f"[Watch Video]({video_url})")
-    if links:
-        embed["description"] += "\n\n" + " | ".join(links)
-
-    if ext in ("gif", "jpg"):
-        embed["image"] = {"url": f"attachment://preview.{ext}"}
-
+    ext = _get_ext(image_type)
+    embed = _build_embed(title, message, camera, label, zone, url, video_url, ext)
     payload = {"embeds": [embed], "attachments": []}
 
     files = {
@@ -123,16 +119,14 @@ def update_discord(webhook_url, message_id, title, message, image_data, image_ty
     if image_data:
         files["file"] = (f"preview.{ext}", image_data, image_type)
 
+    _patch = session.patch if session else requests.patch
     patch_url = f"{webhook_url}/messages/{message_id}"
-    resp = requests.patch(patch_url, files=files, timeout=30)
+    resp = _patch(patch_url, files=files, timeout=15)
 
     # Handle Discord rate limiting
-    if resp.status_code == 429:
-        retry_after = resp.json().get("retry_after", 1)
-        log.warning("Discord rate limited on edit, retry_after=%.1fs", retry_after)
-        import time
-        time.sleep(min(retry_after, 5))
-        resp = requests.patch(patch_url, files=files, timeout=30)
+    def _retry():
+        return _patch(patch_url, files=files, timeout=15)
+    resp = _handle_rate_limit(resp, _retry, "edit", session)
 
     if resp.status_code in (200, 204):
         log.info("Discord message %s updated with GIF", message_id)

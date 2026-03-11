@@ -9,7 +9,8 @@ PUSHOVER_API = "https://api.pushover.net/1/messages.json"
 
 
 def send_pushover(config, recipient, title, message, image_data, image_type="image/gif",
-                   url=None, video_url=None, snooze_url=None, camera_overrides=None, silent=False):
+                   url=None, video_url=None, snooze_url=None, camera_overrides=None, silent=False,
+                   session=None):
     camera_overrides = camera_overrides or {}
 
     data = {
@@ -47,7 +48,8 @@ def send_pushover(config, recipient, title, message, image_data, image_type="ima
         files = {"attachment": (f"preview.{ext}", image_data, image_type)}
 
     try:
-        resp = requests.post(PUSHOVER_API, data=data, files=files, timeout=30)
+        _post = session.post if session else requests.post
+        resp = _post(PUSHOVER_API, data=data, files=files, timeout=15)
         name = recipient.get("name", recipient["userkey"][:8])
         if resp.status_code == 200:
             log.info("Pushover %s to %s", "update sent" if silent else "sent", name)
