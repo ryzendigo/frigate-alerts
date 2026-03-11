@@ -14,4 +14,4 @@ services:
 networks:
   frigate-net:
     external: true
-    name: frigate-notify-doubletake_frigate-net
+    name: frigate-net
