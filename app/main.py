@@ -1,5 +1,5 @@
 """
-Frigate Alerts - Main Application (v2.4 - Hardened for reliability)
+Frigate Alerts - Main Application (v2.5 - Security & reliability hardened)
 Animated GIF notifications from Frigate NVR events.
 Supports: Pushover, Discord, Telegram, Ntfy, Gotify, Email, Webhook
 
@@ -19,6 +19,7 @@ Architecture:
   - Connection-pooled HTTP sessions for notifier providers
 """
 
+import html
 import json
 import logging
 import os
@@ -722,6 +723,9 @@ def fetch_gif(event_id, retries=None, retry_interval=None):
                 gif_data = clip_to_gif(resp.content)
                 if gif_data:
                     return gif_data, "image/gif", "gif"
+            elif resp.status_code == 200:
+                # Clip exists but too small (not ready yet) — NOT a Frigate failure
+                _frigate_success()
             else:
                 _frigate_failure()
             log.warning("Clip not ready for %s (attempt %d/%d, status=%d, size=%d)",
@@ -1310,7 +1314,11 @@ def poll_frigate():
             params = {"severity": "alert", "after": time.time() - lookback, "limit": 50}
             resp = session.get(f"{frigate_url}/api/review", params=params, timeout=10)
             if resp.status_code == 200:
-                reviews = resp.json()
+                try:
+                    reviews = resp.json()
+                except (json.JSONDecodeError, ValueError) as e:
+                    _handle_poll_error(f"Invalid JSON from Frigate: {e}")
+                    continue
                 _last_poll_error = ""
                 _poll_error_count = 0
                 _frigate_success()
@@ -1321,12 +1329,12 @@ def poll_frigate():
                         with _dedup_lock:
                             already_handled = review_id in notified_reviews or review_id in seen_reviews
                         if not already_handled:
-                            event_pool.submit(process_phase1, review)
+                            _safe_submit(event_pool, process_phase1, review)
                         if review.get("end_time"):
                             with _phase2_lock:
                                 has_pending = review_id in pending_phase2
                             if has_pending:
-                                event_pool.submit(process_phase2, review_id)
+                                _safe_submit(event_pool, process_phase2, review_id)
             else:
                 _frigate_failure()
                 _handle_poll_error(f"HTTP {resp.status_code}")
@@ -1393,6 +1401,17 @@ def on_disconnect(client, userdata, rc, *args):
         log.warning("MQTT disconnected unexpectedly (rc=%d), will reconnect", rc)
 
 
+def _safe_submit(pool, fn, *args):
+    """Submit to pool, suppressing RuntimeError during shutdown."""
+    if shutting_down.is_set():
+        return None
+    try:
+        return pool.submit(fn, *args)
+    except RuntimeError:
+        # Pool is shut down — discard silently
+        return None
+
+
 def on_message(client, userdata, msg):
     try:
         payload = json.loads(msg.payload)
@@ -1404,7 +1423,7 @@ def on_message(client, userdata, msg):
             return
 
         if msg_type == "new":
-            event_pool.submit(process_phase1, review)
+            _safe_submit(event_pool, process_phase1, review)
 
         elif msg_type == "update":
             review_id = review.get("id", "")
@@ -1418,12 +1437,12 @@ def on_message(client, userdata, msg):
                     with _dedup_lock:
                         seen_reviews.pop(review_id, None)
                     log.info("Update promoted to Phase 1: %s camera=%s objects=%s", review_id, camera, objects)
-                    event_pool.submit(process_phase1, review)
+                    _safe_submit(event_pool, process_phase1, review)
 
         elif msg_type == "end":
             review_id = review.get("id", "")
             if review_id:
-                event_pool.submit(process_phase2, review_id)
+                _safe_submit(event_pool, process_phase2, review_id)
 
     except json.JSONDecodeError:
         log.warning("MQTT: received invalid JSON")
@@ -1515,10 +1534,11 @@ def build_event_page(event_id):
     except Exception:
         return None
 
-    camera = event.get("camera", "unknown")
-    label = event.get("label", "unknown").title()
+    camera = html.escape(event.get("camera", "unknown"))
+    label = html.escape(event.get("label", "unknown").title())
     start = datetime.fromtimestamp(event.get("start_time", 0)).strftime("%Y-%m-%d %H:%M:%S")
-    zones = ", ".join(event.get("zones", [])) or "none"
+    zones = html.escape(", ".join(event.get("zones", [])) or "none")
+    event_id = html.escape(str(event_id))
     media_base = frigate_public or frigate_url
     clip_url = f"{media_base}/api/events/{event_id}/clip.mp4"
     gif_url = f"{media_base}/api/events/{event_id}/preview.gif"
@@ -1580,7 +1600,7 @@ async def lifespan(app: FastAPI):
     # Start cleanup loop
     threading.Thread(target=run_cleanup_loop, daemon=True).start()
 
-    log.info("Frigate Alerts v2.4 started (MQTT=%s, poll=%ds, event_pool=%d, provider_pool=%d)",
+    log.info("Frigate Alerts v2.5 started (MQTT=%s, poll=%ds, event_pool=%d, provider_pool=%d)",
              "enabled" if mqtt_conf.get("enabled") and mqtt_conf.get("server") else "disabled",
              config.get("poll_interval", 5),
              event_pool._max_workers,
@@ -1613,9 +1633,25 @@ async def event_page(event_id: str):
     return HTMLResponse("<h1>Event not found</h1>", status_code=404)
 
 
+def _mask_secrets(obj, _sensitive={"token", "password", "secret", "api_key", "apikey", "userkey", "webhook"}):
+    """Recursively mask sensitive config values for safe API exposure."""
+    if isinstance(obj, dict):
+        masked = {}
+        for k, v in obj.items():
+            if any(s in k.lower() for s in _sensitive) and isinstance(v, str) and len(v) > 4:
+                masked[k] = v[:4] + "****"
+            elif k == "url" and isinstance(v, str) and ("webhook" in v.lower() or "hooks" in v.lower()):
+                masked[k] = v[:30] + "****" if len(v) > 30 else "****"
+            else:
+                masked[k] = _mask_secrets(v)
+        return masked
+    elif isinstance(obj, list):
+        return [_mask_secrets(i) for i in obj]
+    return obj
+
 @app.get("/api/config")
 async def get_config():
-    return json.loads(json.dumps(config))
+    return _mask_secrets(json.loads(json.dumps(config)))
 
 
 @app.post("/api/config")
@@ -1708,6 +1744,8 @@ async def test_notification():
     session = _get_session()
     try:
         resp = session.get(f"{frigate_url}/api/events?limit=1&has_clip=1", timeout=10)
+        if resp.status_code != 200:
+            return {"status": "error", "message": f"Frigate returned {resp.status_code}"}
         events = resp.json()
         if not events:
             return {"status": "error", "message": "No events in Frigate"}
@@ -1743,7 +1781,7 @@ async def test_notification():
         else:
             log.info("Test Phase 2: No GIF available, snapshot stands")
 
-    event_pool.submit(_run_test)
+    _safe_submit(event_pool, _run_test)
     return {"status": "ok", "camera": event["camera"], "label": event["label"]}
 
 
