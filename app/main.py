@@ -1,10 +1,11 @@
 """
-Frigate Alerts - Main Application (v2 - Rewritten for speed & reliability)
+Frigate Alerts - Main Application (v2.1 - Hardened for reliability)
 Animated GIF notifications from Frigate NVR events.
 Supports: Pushover, Discord, Telegram, Ntfy, Gotify, Email, Webhook
 
 Architecture:
   - MQTT primary (instant): subscribes to frigate/reviews, fires on "new"
+  - MQTT "update" handler: catches late object detection (e.g., car→person)
   - API polling fallback: catches anything MQTT misses
   - Two-phase notifications:
       Phase 1: Instant snapshot on event creation (<2s target)
@@ -23,7 +24,7 @@ import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
@@ -56,10 +57,8 @@ DB_PATH = os.environ.get("DB_PATH", "/app/config/alerts.db")
 config = {}
 mqtt_client = None
 mqtt_connected = False
-mqtt_reconnect_delay = 1
 poller_running = False
-cleanup_running = False
-shutting_down = False
+shutting_down = threading.Event()
 
 # Thread-safe dedup
 _dedup_lock = threading.Lock()
@@ -70,8 +69,12 @@ seen_reviews = set()       # Reviews we've seen (sent OR filtered) - prevents re
 _phase2_lock = threading.Lock()
 pending_phase2 = {}
 
-# Cooldown: camera -> last notification timestamp
+# Thread-safe cooldown and stats
+_cooldown_lock = threading.Lock()
 camera_cooldowns = {}
+
+_stats_lock = threading.Lock()
+stats = {"phase1_sent": 0, "phase2_sent": 0, "events_received": 0, "events_skipped": 0, "errors": 0}
 
 # Snooze: timestamp when snooze expires (0 = not snoozed)
 snooze_until = 0
@@ -79,14 +82,63 @@ snooze_until = 0
 # Provider thread pool (reused across notifications)
 provider_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="notify")
 
-# Stats
-stats = {"phase1_sent": 0, "phase2_sent": 0, "events_received": 0, "events_skipped": 0, "errors": 0}
+# Reusable HTTP session for Frigate API (connection pooling)
+_http_session = None
+_http_lock = threading.Lock()
+
+# Poller error suppression
+_last_poll_error = ""
+_poll_error_count = 0
+
+
+def _get_session():
+    """Get or create a reusable requests.Session with connection pooling."""
+    global _http_session
+    if _http_session is None:
+        with _http_lock:
+            if _http_session is None:
+                s = requests.Session()
+                adapter = requests.adapters.HTTPAdapter(
+                    pool_connections=4, pool_maxsize=8, max_retries=0
+                )
+                s.mount("http://", adapter)
+                s.mount("https://", adapter)
+                _http_session = s
+    return _http_session
+
+
+def _inc_stat(key, value=1):
+    with _stats_lock:
+        stats[key] = stats.get(key, 0) + value
+
+
+def _add_to_seen(review_id):
+    """Track a review as seen (filtered/stale). Trims to prevent unbounded growth."""
+    with _dedup_lock:
+        seen_reviews.add(review_id)
+        if len(seen_reviews) > 3000:
+            # Keep most recent 2000 (sorted by review_id which is timestamp-based)
+            trimmed = sorted(seen_reviews)[-2000:]
+            seen_reviews.clear()
+            seen_reviews.update(trimmed)
 
 
 def load_config():
     global config
-    with open(CONFIG_PATH) as f:
-        config = yaml.safe_load(f) or {}
+    try:
+        with open(CONFIG_PATH) as f:
+            loaded = yaml.safe_load(f)
+        if not isinstance(loaded, dict):
+            log.error("Config file is not a valid YAML dict, using defaults")
+            config = {}
+        else:
+            config = loaded
+    except FileNotFoundError:
+        log.error("Config file not found: %s, using defaults", CONFIG_PATH)
+        config = {}
+    except yaml.YAMLError as e:
+        log.error("Config file has invalid YAML: %s, using defaults", e)
+        config = {}
     return config
 
 
@@ -101,115 +153,117 @@ def save_config(new_config):
 # Database
 # ---------------------------------------------------------------------------
 
+@contextmanager
 def get_db():
+    """Context manager for SQLite connections. Ensures proper cleanup."""
     conn = sqlite3.connect(DB_PATH, timeout=10)
-    conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=5000")
-    return conn
+    try:
+        yield conn
+    finally:
+        conn.close()
 
 
 def init_db():
-    conn = get_db()
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp REAL,
-            review_id TEXT,
-            event_id TEXT,
-            camera TEXT,
-            label TEXT,
-            zones TEXT,
-            provider TEXT,
-            recipient TEXT,
-            status TEXT,
-            message TEXT,
-            gif_size INTEGER
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS pending_events (
-            review_id TEXT PRIMARY KEY,
-            event_data TEXT,
-            phase TEXT,
-            attempts INTEGER DEFAULT 0,
-            next_retry REAL,
-            created_at REAL
-        )
-    """)
-    conn.commit()
-    conn.close()
+    with get_db() as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp REAL,
+                review_id TEXT,
+                event_id TEXT,
+                camera TEXT,
+                label TEXT,
+                zones TEXT,
+                provider TEXT,
+                recipient TEXT,
+                status TEXT,
+                message TEXT,
+                gif_size INTEGER
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS pending_events (
+                review_id TEXT PRIMARY KEY,
+                event_data TEXT,
+                phase TEXT,
+                attempts INTEGER DEFAULT 0,
+                next_retry REAL,
+                created_at REAL
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_history_timestamp ON history(timestamp)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_pending_next_retry ON pending_events(next_retry)")
+        conn.commit()
 
 
 def log_notification(review_id, event_id, camera, label, zones, provider, recipient, status, message="", gif_size=0):
     try:
-        conn = get_db()
-        conn.execute(
-            "INSERT INTO history (timestamp, review_id, event_id, camera, label, zones, provider, recipient, status, message, gif_size) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (time.time(), review_id, event_id, camera, label, zones, provider, recipient, status, message, gif_size),
-        )
-        conn.commit()
-        conn.close()
+        with get_db() as conn:
+            conn.execute(
+                "INSERT INTO history (timestamp, review_id, event_id, camera, label, zones, provider, recipient, status, message, gif_size) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (time.time(), review_id, event_id, camera, label, zones, provider, recipient, status, message, gif_size),
+            )
+            conn.commit()
     except Exception as e:
-        log.error("DB error: %s", e)
+        log.error("DB log error: %s", e)
 
 
 def get_history(limit=50):
     try:
-        conn = get_db()
-        conn.row_factory = sqlite3.Row
-        rows = conn.execute("SELECT * FROM history ORDER BY timestamp DESC LIMIT ?", (limit,)).fetchall()
-        conn.close()
-        return [dict(r) for r in rows]
+        with get_db() as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute("SELECT * FROM history ORDER BY timestamp DESC LIMIT ?", (limit,)).fetchall()
+            return [dict(r) for r in rows]
     except Exception:
         return []
 
 
 def save_pending_event(review_id, event_data, phase):
     try:
-        conn = get_db()
-        conn.execute(
-            "INSERT OR REPLACE INTO pending_events (review_id, event_data, phase, attempts, next_retry, created_at) VALUES (?, ?, ?, 0, ?, ?)",
-            (review_id, json.dumps(event_data), phase, time.time(), time.time()),
-        )
-        conn.commit()
-        conn.close()
+        with get_db() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO pending_events (review_id, event_data, phase, attempts, next_retry, created_at) VALUES (?, ?, ?, 0, ?, ?)",
+                (review_id, json.dumps(event_data), phase, time.time(), time.time()),
+            )
+            conn.commit()
     except Exception as e:
         log.error("Save pending event error: %s", e)
 
 
 def remove_pending_event(review_id):
     try:
-        conn = get_db()
-        conn.execute("DELETE FROM pending_events WHERE review_id = ?", (review_id,))
-        conn.commit()
-        conn.close()
+        with get_db() as conn:
+            conn.execute("DELETE FROM pending_events WHERE review_id = ?", (review_id,))
+            conn.commit()
     except Exception as e:
         log.error("Remove pending event error: %s", e)
 
 
 def get_pending_events():
     try:
-        conn = get_db()
-        conn.row_factory = sqlite3.Row
-        rows = conn.execute(
-            "SELECT * FROM pending_events WHERE next_retry <= ? AND attempts < 3 ORDER BY created_at",
-            (time.time(),),
-        ).fetchall()
-        conn.close()
-        return [dict(r) for r in rows]
+        with get_db() as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT * FROM pending_events WHERE next_retry <= ? AND attempts < 5 ORDER BY created_at",
+                (time.time(),),
+            ).fetchall()
+            return [dict(r) for r in rows]
     except Exception:
         return []
 
 
-def increment_pending_retry(review_id):
+def increment_pending_retry(review_id, attempts):
+    """Exponential backoff: 30s, 60s, 120s, 240s, 480s"""
+    backoff = min(30 * (2 ** attempts), 600)
     try:
-        conn = get_db()
-        conn.execute(
-            "UPDATE pending_events SET attempts = attempts + 1, next_retry = ? WHERE review_id = ?",
-            (time.time() + 30, review_id),
-        )
-        conn.commit()
-        conn.close()
+        with get_db() as conn:
+            conn.execute(
+                "UPDATE pending_events SET attempts = attempts + 1, next_retry = ? WHERE review_id = ?",
+                (time.time() + backoff, review_id),
+            )
+            conn.commit()
     except Exception as e:
         log.error("Increment retry error: %s", e)
 
@@ -218,26 +272,42 @@ def cleanup_history():
     retention_days = config.get("history_retention_days", 30)
     cutoff = time.time() - (retention_days * 86400)
     try:
-        conn = get_db()
-        result = conn.execute("DELETE FROM history WHERE timestamp < ?", (cutoff,))
-        deleted = result.rowcount
-        # Also clean old pending events (>1 hour)
-        conn.execute("DELETE FROM pending_events WHERE created_at < ?", (time.time() - 3600,))
-        conn.commit()
-        conn.close()
-        if deleted > 0:
-            log.info("Cleaned up %d history entries older than %d days", deleted, retention_days)
+        with get_db() as conn:
+            result = conn.execute("DELETE FROM history WHERE timestamp < ?", (cutoff,))
+            deleted = result.rowcount
+            # Also clean old pending events (>2 hours)
+            conn.execute("DELETE FROM pending_events WHERE created_at < ?", (time.time() - 7200,))
+            conn.commit()
+            if deleted > 0:
+                log.info("Cleaned up %d history entries older than %d days", deleted, retention_days)
     except Exception as e:
         log.error("History cleanup error: %s", e)
 
 
 def run_cleanup_loop():
-    global cleanup_running
-    cleanup_running = True
-    while cleanup_running and not shutting_down:
+    while not shutting_down.is_set():
         cleanup_history()
+        # Also trim in-memory sets periodically
+        with _dedup_lock:
+            if len(notified_reviews) > 2000:
+                trimmed = sorted(notified_reviews)[-1000:]
+                notified_reviews.clear()
+                notified_reviews.update(trimmed)
+            if len(seen_reviews) > 3000:
+                trimmed = sorted(seen_reviews)[-2000:]
+                seen_reviews.clear()
+                seen_reviews.update(trimmed)
+        # Clean stale pending_phase2 entries (>10 min old, safety net)
+        with _phase2_lock:
+            stale = [rid for rid, ctx in pending_phase2.items()
+                     if time.time() - ctx.get("created_at", 0) > 600]
+            for rid in stale:
+                pending_phase2.pop(rid, None)
+            if stale:
+                log.info("Cleaned %d stale pending_phase2 entries", len(stale))
+        # Sleep 6 hours, checking shutdown every second
         for _ in range(6 * 3600):
-            if not cleanup_running or shutting_down:
+            if shutting_down.is_set():
                 return
             time.sleep(1)
 
@@ -272,12 +342,14 @@ def check_cooldown(camera):
     cooldown_secs = config.get("cooldown", 0)
     if cooldown_secs <= 0:
         return False
-    last = camera_cooldowns.get(camera, 0)
+    with _cooldown_lock:
+        last = camera_cooldowns.get(camera, 0)
     return time.time() - last < cooldown_secs
 
 
 def set_cooldown(camera):
-    camera_cooldowns[camera] = time.time()
+    with _cooldown_lock:
+        camera_cooldowns[camera] = time.time()
 
 
 def check_zones(event_zones):
@@ -310,7 +382,7 @@ def should_notify(camera, labels, zones):
 def render_template(template, variables):
     try:
         return template.format(**variables)
-    except (KeyError, ValueError):
+    except (KeyError, ValueError, IndexError):
         return template
 
 
@@ -343,11 +415,13 @@ def build_message(camera, label_str, zone_str, review_id, event_id):
 # ---------------------------------------------------------------------------
 
 def clip_to_gif(clip_data, max_duration=3, fps=6, width=240):
-    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as mp4:
-        mp4.write(clip_data)
-        mp4_path = mp4.name
-    gif_path = mp4_path.replace(".mp4", ".gif")
+    mp4_path = None
+    gif_path = None
     try:
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as mp4:
+            mp4.write(clip_data)
+            mp4_path = mp4.name
+        gif_path = mp4_path.replace(".mp4", ".gif")
         cmd = [
             "ffmpeg", "-y", "-i", mp4_path,
             "-t", str(max_duration),
@@ -355,7 +429,7 @@ def clip_to_gif(clip_data, max_duration=3, fps=6, width=240):
             "-loop", "0",
             gif_path,
         ]
-        result = subprocess.run(cmd, capture_output=True, timeout=30)
+        result = subprocess.run(cmd, capture_output=True, timeout=20)
         if result.returncode == 0 and os.path.exists(gif_path):
             with open(gif_path, "rb") as f:
                 gif_data = f.read()
@@ -363,29 +437,40 @@ def clip_to_gif(clip_data, max_duration=3, fps=6, width=240):
                 log.info("Generated GIF from clip (%d bytes)", len(gif_data))
                 return gif_data
         else:
-            log.warning("ffmpeg GIF conversion failed: %s", result.stderr[-200:] if result.stderr else "unknown")
+            stderr = result.stderr[-200:].decode("utf-8", errors="replace") if result.stderr else "unknown"
+            log.warning("ffmpeg GIF conversion failed: %s", stderr)
+    except subprocess.TimeoutExpired:
+        log.warning("ffmpeg GIF conversion timed out (20s)")
     except Exception as e:
         log.warning("GIF conversion error: %s", e)
     finally:
         for p in (mp4_path, gif_path):
-            try:
-                os.unlink(p)
-            except OSError:
-                pass
+            if p:
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
     return None
 
 
 def fetch_snapshot(event_id):
     frigate_url = config.get("frigate", {}).get("url", "http://frigate:5000")
+    session = _get_session()
     for attempt in range(3):
         try:
-            resp = requests.get(f"{frigate_url}/api/events/{event_id}/snapshot.jpg", timeout=5)
+            resp = session.get(f"{frigate_url}/api/events/{event_id}/snapshot.jpg", timeout=5)
             if resp.status_code == 200 and len(resp.content) > 100:
                 log.info("Fetched snapshot for %s (%d bytes)", event_id, len(resp.content))
                 return resp.content, "image/jpeg", "jpg"
             if resp.status_code == 404 and attempt < 2:
                 time.sleep(0.5)
                 continue
+        except requests.exceptions.ConnectionError:
+            log.warning("Snapshot fetch: Frigate connection refused (attempt %d)", attempt + 1)
+            if attempt < 2:
+                time.sleep(1)
+        except requests.exceptions.Timeout:
+            log.warning("Snapshot fetch timeout (attempt %d)", attempt + 1)
         except Exception as e:
             log.error("Snapshot fetch failed (attempt %d): %s", attempt + 1, e)
             if attempt < 2:
@@ -397,23 +482,29 @@ def fetch_gif(event_id, retries=None, retry_interval=None):
     frigate_url = config.get("frigate", {}).get("url", "http://frigate:5000")
     retries = retries or config.get("gif_retries", 3)
     retry_interval = retry_interval or config.get("gif_retry_interval", 5)
+    session = _get_session()
 
     for attempt in range(1, retries + 1):
         try:
-            resp = requests.get(f"{frigate_url}/api/events/{event_id}/clip.mp4", timeout=30)
+            resp = session.get(f"{frigate_url}/api/events/{event_id}/clip.mp4", timeout=30)
             if resp.status_code == 200 and len(resp.content) > 1000:
                 gif_data = clip_to_gif(resp.content)
                 if gif_data:
                     return gif_data, "image/gif", "gif"
-            log.warning("Clip not ready for %s (attempt %d/%d)", event_id, attempt, retries)
+            log.warning("Clip not ready for %s (attempt %d/%d, status=%d, size=%d)",
+                       event_id, attempt, retries, resp.status_code, len(resp.content))
+        except requests.exceptions.ConnectionError:
+            log.warning("Clip fetch: Frigate connection refused (attempt %d/%d)", attempt, retries)
+        except requests.exceptions.Timeout:
+            log.warning("Clip fetch timeout (attempt %d/%d)", attempt, retries)
         except Exception as e:
-            log.warning("Clip fetch error: %s", e)
+            log.warning("Clip fetch error (attempt %d/%d): %s", attempt, retries, e)
         if attempt < retries:
             time.sleep(retry_interval)
 
     # Fallback to Frigate's preview.gif
     try:
-        resp = requests.get(f"{frigate_url}/api/events/{event_id}/preview.gif", timeout=15)
+        resp = session.get(f"{frigate_url}/api/events/{event_id}/preview.gif", timeout=15)
         if resp.status_code == 200 and len(resp.content) > 100:
             log.info("Fell back to Frigate preview.gif for %s (%d bytes)", event_id, len(resp.content))
             return resp.content, "image/gif", "gif"
@@ -427,8 +518,9 @@ def fetch_media(event_id, retries=None, retry_interval=None):
     media_type = config.get("media_type", "gif")
     if media_type == "clip":
         frigate_url = config.get("frigate", {}).get("url", "http://frigate:5000")
+        session = _get_session()
         try:
-            resp = requests.get(f"{frigate_url}/api/events/{event_id}/clip.mp4", timeout=30)
+            resp = session.get(f"{frigate_url}/api/events/{event_id}/clip.mp4", timeout=30)
             if resp.status_code == 200 and len(resp.content) > 1000:
                 return resp.content, "video/mp4", "mp4"
         except Exception as e:
@@ -472,7 +564,7 @@ def send_to_all_providers(title, message, media_data, media_type, media_ext,
     snooze_url = build_snooze_url(30)
     media_size = len(media_data) if media_data else 0
     msg_refs = {}
-    futures = []
+    _refs_lock = threading.Lock()
 
     def _send_pushover_all():
         po = config.get("pushover", {})
@@ -493,10 +585,11 @@ def send_to_all_providers(title, message, media_data, media_type, media_ext,
                 )
                 log_notification(review_id, event_id, camera, label_str, zone_str, "pushover", r.get("name", ""), status, gif_size=media_size)
             except Exception as e:
-                log.error("Pushover send error: %s", e)
-                stats["errors"] += 1
+                log.error("Pushover send error (%s): %s", r.get("name", "?"), e)
+                _inc_stat("errors")
             po_refs.append({"config": po, "recipient": r, "camera_overrides": cam_overrides})
-        msg_refs["pushover"] = po_refs
+        with _refs_lock:
+            msg_refs["pushover"] = po_refs
 
     def _send_discord_all():
         dc = config.get("discord", {})
@@ -514,9 +607,10 @@ def send_to_all_providers(title, message, media_data, media_type, media_ext,
                 if message_id:
                     dc_refs.append({"webhook_url": w.get("url", ""), "message_id": message_id})
             except Exception as e:
-                log.error("Discord send error: %s", e)
-                stats["errors"] += 1
-        msg_refs["discord"] = dc_refs
+                log.error("Discord send error (%s): %s", w.get("name", "?"), e)
+                _inc_stat("errors")
+        with _refs_lock:
+            msg_refs["discord"] = dc_refs
 
     def _send_telegram():
         tg = config.get("telegram", {})
@@ -527,7 +621,7 @@ def send_to_all_providers(title, message, media_data, media_type, media_ext,
             log_notification(review_id, event_id, camera, label_str, zone_str, "telegram", tg.get("chat_id", ""), status, gif_size=media_size)
         except Exception as e:
             log.error("Telegram send error: %s", e)
-            stats["errors"] += 1
+            _inc_stat("errors")
 
     def _send_ntfy():
         nt = config.get("ntfy", {})
@@ -538,7 +632,7 @@ def send_to_all_providers(title, message, media_data, media_type, media_ext,
             log_notification(review_id, event_id, camera, label_str, zone_str, "ntfy", nt.get("topic", ""), status, gif_size=media_size)
         except Exception as e:
             log.error("Ntfy send error: %s", e)
-            stats["errors"] += 1
+            _inc_stat("errors")
 
     def _send_gotify():
         go = config.get("gotify", {})
@@ -549,7 +643,7 @@ def send_to_all_providers(title, message, media_data, media_type, media_ext,
             log_notification(review_id, event_id, camera, label_str, zone_str, "gotify", "server", status, gif_size=media_size)
         except Exception as e:
             log.error("Gotify send error: %s", e)
-            stats["errors"] += 1
+            _inc_stat("errors")
 
     def _send_smtp():
         em = config.get("smtp", {})
@@ -560,7 +654,7 @@ def send_to_all_providers(title, message, media_data, media_type, media_ext,
             log_notification(review_id, event_id, camera, label_str, zone_str, "email", ", ".join(em.get("recipients", [])), status, gif_size=media_size)
         except Exception as e:
             log.error("SMTP send error: %s", e)
-            stats["errors"] += 1
+            _inc_stat("errors")
 
     def _send_webhook():
         wh = config.get("webhook", {})
@@ -572,7 +666,7 @@ def send_to_all_providers(title, message, media_data, media_type, media_ext,
             log_notification(review_id, event_id, camera, label_str, zone_str, "webhook", wh.get("url", "")[:30], status, gif_size=media_size)
         except Exception as e:
             log.error("Webhook send error: %s", e)
-            stats["errors"] += 1
+            _inc_stat("errors")
 
     # Fire all providers in parallel
     senders = [_send_pushover_all, _send_discord_all, _send_telegram, _send_ntfy, _send_gotify, _send_smtp, _send_webhook]
@@ -581,12 +675,16 @@ def send_to_all_providers(title, message, media_data, media_type, media_ext,
         send_futures.append(provider_pool.submit(sender))
 
     # Wait for all to complete (max 30s)
-    for f in as_completed(send_futures, timeout=30):
-        try:
-            f.result()
-        except Exception as e:
-            log.error("Provider dispatch error: %s", e)
-            stats["errors"] += 1
+    try:
+        for f in as_completed(send_futures, timeout=30):
+            try:
+                f.result()
+            except Exception as e:
+                log.error("Provider dispatch error: %s", e)
+                _inc_stat("errors")
+    except TimeoutError:
+        log.error("Provider dispatch timeout — some providers may still be running")
+        _inc_stat("errors")
 
     return msg_refs
 
@@ -628,11 +726,14 @@ def update_all_providers(msg_refs, title, message, media_data, media_type, media
     futures.append(provider_pool.submit(_update_discord))
     futures.append(provider_pool.submit(_update_pushover))
 
-    for f in as_completed(futures, timeout=30):
-        try:
-            f.result()
-        except Exception as e:
-            log.error("Provider update error: %s", e)
+    try:
+        for f in as_completed(futures, timeout=30):
+            try:
+                f.result()
+            except Exception as e:
+                log.error("Provider update error: %s", e)
+    except TimeoutError:
+        log.error("Provider update timeout — some providers may still be running")
 
 
 # ---------------------------------------------------------------------------
@@ -645,11 +746,6 @@ def _add_to_dedup(review_id):
         if review_id in notified_reviews:
             return False
         notified_reviews.add(review_id)
-        if len(notified_reviews) > 2000:
-            # Keep most recent 1000
-            sorted_ids = sorted(notified_reviews)
-            notified_reviews.clear()
-            notified_reviews.update(sorted_ids[-1000:])
         return True
 
 
@@ -661,39 +757,36 @@ def process_phase1(review):
     detections = review.get("data", {}).get("detections", [])
     zones = review.get("data", {}).get("zones", [])
 
-    stats["events_received"] += 1
+    _inc_stat("events_received")
 
     # Stale event filter (skip events older than 5 minutes)
     start_time = review.get("start_time", 0)
     if start_time and (time.time() - start_time) > 300:
         log.info("Skipping stale event %s (%.0fs old)", review_id, time.time() - start_time)
-        with _dedup_lock:
-            seen_reviews.add(review_id)
-        stats["events_skipped"] += 1
+        _add_to_seen(review_id)
+        _inc_stat("events_skipped")
         return
 
     if is_snoozed():
         log.info("Skipping %s: snoozed until %s", review_id, datetime.fromtimestamp(snooze_until).strftime("%H:%M"))
-        stats["events_skipped"] += 1
+        _inc_stat("events_skipped")
         return
     if in_quiet_hours():
         log.info("Skipping %s: quiet hours active", review_id)
-        stats["events_skipped"] += 1
+        _inc_stat("events_skipped")
         return
     if not should_notify(camera, objects, zones):
-        # Track as seen to prevent repeat log spam from poller
-        with _dedup_lock:
-            seen_reviews.add(review_id)
-            if len(seen_reviews) > 3000:
-                seen_reviews.clear()
-        stats["events_skipped"] += 1
+        _add_to_seen(review_id)
+        _inc_stat("events_skipped")
         return
     if check_cooldown(camera):
         log.info("Skipping %s: camera %s in cooldown", review_id, camera)
-        stats["events_skipped"] += 1
+        _inc_stat("events_skipped")
         return
-    if not detections:
-        stats["events_skipped"] += 1
+
+    # Validate detections list
+    if not isinstance(detections, list) or not detections:
+        _inc_stat("events_skipped")
         return
 
     # Thread-safe dedup — only after passing all filters
@@ -727,7 +820,7 @@ def process_phase1(review):
     )
     elapsed = time.time() - t_start
     log.info("Phase 1 SENT for %s in %.1fs (camera=%s)", review_id, elapsed, camera)
-    stats["phase1_sent"] += 1
+    _inc_stat("phase1_sent")
 
     # Remove from pending if it was retried
     remove_pending_event(review_id)
@@ -736,6 +829,12 @@ def process_phase1(review):
     media_type_cfg = config.get("media_type", "gif")
     if media_type_cfg != "snapshot":
         with _phase2_lock:
+            # Cap pending_phase2 to prevent memory leak
+            if len(pending_phase2) >= 200:
+                # Evict oldest entry
+                oldest_key = min(pending_phase2, key=lambda k: pending_phase2[k].get("created_at", 0))
+                pending_phase2.pop(oldest_key, None)
+                log.warning("pending_phase2 full, evicted oldest entry %s", oldest_key)
             pending_phase2[review_id] = {
                 "msg_refs": msg_refs,
                 "title": title,
@@ -753,7 +852,7 @@ def process_phase1(review):
 def process_phase2(review_id):
     """Phase 2: GIF upgrade when event ends."""
     with _phase2_lock:
-        ctx = pending_phase2.pop(review_id, None)
+        ctx = pending_phase2.get(review_id)
     if not ctx:
         return
 
@@ -774,14 +873,18 @@ def process_phase2(review_id):
         )
         elapsed = time.time() - t_start
         log.info("Phase 2 SENT for %s in %.1fs (%d bytes)", review_id, elapsed, len(gif_data))
-        stats["phase2_sent"] += 1
+        _inc_stat("phase2_sent")
+        # Only remove from pending on success
+        with _phase2_lock:
+            pending_phase2.pop(review_id, None)
     else:
-        log.info("Phase 2: No GIF available for %s, snapshot stands", event_id)
+        log.warning("Phase 2: No GIF available for %s, will retry on timeout", event_id)
+        # Don't pop — let timeout loop retry once more
 
 
 def phase2_timeout_loop():
     """Background loop: trigger Phase 2 for events that never got an 'end' message."""
-    while not shutting_down:
+    while not shutting_down.is_set():
         timeout = config.get("phase2_timeout", 60)
         now = time.time()
         expired = []
@@ -791,13 +894,36 @@ def phase2_timeout_loop():
                     expired.append(rid)
 
         for rid in expired:
-            log.info("Phase 2 timeout for %s, attempting GIF anyway", rid)
+            log.info("Phase 2 timeout for %s, attempting GIF", rid)
             try:
-                process_phase2(rid)
+                # Force-pop on timeout (last chance)
+                with _phase2_lock:
+                    ctx = pending_phase2.pop(rid, None)
+                if not ctx:
+                    continue
+
+                event_id = ctx["event_id"]
+                time.sleep(1)
+                gif_data, gif_type, gif_ext = fetch_gif(event_id, retries=2, retry_interval=3)
+                if gif_data:
+                    update_all_providers(
+                        ctx["msg_refs"], ctx["title"], ctx["message"],
+                        gif_data, gif_type, gif_ext,
+                        ctx["frigate_url"], ctx["video_url"], rid, event_id,
+                        ctx["camera"], ctx["label_str"], ctx["zone_str"],
+                    )
+                    log.info("Phase 2 timeout SENT for %s (%d bytes)", rid, len(gif_data))
+                    _inc_stat("phase2_sent")
+                else:
+                    log.info("Phase 2 timeout: No GIF for %s, snapshot stands", event_id)
             except Exception as e:
                 log.error("Phase 2 timeout error for %s: %s", rid, e)
 
-        time.sleep(5)
+        # Check every 5 seconds
+        for _ in range(5):
+            if shutting_down.is_set():
+                return
+            time.sleep(1)
 
 
 # ---------------------------------------------------------------------------
@@ -806,11 +932,11 @@ def phase2_timeout_loop():
 
 def pending_retry_loop():
     """Retry failed Phase 1 notifications from the persistent queue."""
-    while not shutting_down:
+    while not shutting_down.is_set():
         try:
             pending = get_pending_events()
             for row in pending:
-                if shutting_down:
+                if shutting_down.is_set():
                     return
                 review_id = row["review_id"]
                 try:
@@ -819,13 +945,21 @@ def pending_retry_loop():
                     # Remove from dedup so it can be reprocessed
                     with _dedup_lock:
                         notified_reviews.discard(review_id)
+                        seen_reviews.discard(review_id)
                     process_phase1(event_data)
+                except json.JSONDecodeError:
+                    log.error("Pending event %s has corrupt JSON, removing", review_id)
+                    remove_pending_event(review_id)
                 except Exception as e:
                     log.error("Pending retry error for %s: %s", review_id, e)
-                    increment_pending_retry(review_id)
+                    increment_pending_retry(review_id, row["attempts"])
         except Exception as e:
             log.error("Pending retry loop error: %s", e)
-        time.sleep(10)
+        # Check every 10 seconds
+        for _ in range(10):
+            if shutting_down.is_set():
+                return
+            time.sleep(1)
 
 
 # ---------------------------------------------------------------------------
@@ -833,37 +967,72 @@ def pending_retry_loop():
 # ---------------------------------------------------------------------------
 
 def poll_frigate():
-    global poller_running
+    global poller_running, _last_poll_error, _poll_error_count
     poller_running = True
     frigate_url = config.get("frigate", {}).get("url", "http://frigate:5000")
     poll_interval = config.get("poll_interval", 5)
     lookback = 120  # Check last 2 minutes
+    session = _get_session()
 
     log.info("API poller started (interval=%ds, url=%s)", poll_interval, frigate_url)
 
-    while poller_running and not shutting_down:
+    while poller_running and not shutting_down.is_set():
         try:
             params = {"severity": "alert", "after": time.time() - lookback, "limit": 50}
-            resp = requests.get(f"{frigate_url}/api/review", params=params, timeout=10)
+            resp = session.get(f"{frigate_url}/api/review", params=params, timeout=10)
             if resp.status_code == 200:
                 reviews = resp.json()
+                # Reset error tracking on success
+                _last_poll_error = ""
+                _poll_error_count = 0
+
                 for review in reviews:
                     # Process ANY alert review, not just ended ones
                     if review.get("severity") == "alert":
                         review_id = review.get("id", "")
-                        # Quick check: skip if already sent or already seen and filtered
-                        if review_id not in notified_reviews and review_id not in seen_reviews:
+                        # Thread-safe check: skip if already sent or already seen and filtered
+                        with _dedup_lock:
+                            already_handled = review_id in notified_reviews or review_id in seen_reviews
+                        if not already_handled:
                             threading.Thread(
                                 target=process_phase1, args=(review,), daemon=True
                             ).start()
                         # Check for ended reviews to trigger Phase 2
-                        if review.get("end_time") and review_id in pending_phase2:
-                            threading.Thread(
-                                target=process_phase2, args=(review_id,), daemon=True
-                            ).start()
+                        if review.get("end_time"):
+                            with _phase2_lock:
+                                has_pending = review_id in pending_phase2
+                            if has_pending:
+                                threading.Thread(
+                                    target=process_phase2, args=(review_id,), daemon=True
+                                ).start()
+            else:
+                _handle_poll_error(f"HTTP {resp.status_code}")
+        except requests.exceptions.ConnectionError:
+            _handle_poll_error("Frigate connection refused")
+        except requests.exceptions.Timeout:
+            _handle_poll_error("Frigate request timeout")
         except Exception as e:
-            log.warning("API poll error: %s", e)
-        time.sleep(poll_interval)
+            _handle_poll_error(str(e))
+
+        # Interruptible sleep
+        for _ in range(poll_interval):
+            if not poller_running or shutting_down.is_set():
+                return
+            time.sleep(1)
+
+
+def _handle_poll_error(error_msg):
+    """Suppress repeated identical poll errors to avoid log spam."""
+    global _last_poll_error, _poll_error_count
+    if error_msg == _last_poll_error:
+        _poll_error_count += 1
+        # Only log every 12th occurrence (= once per minute at 5s interval)
+        if _poll_error_count % 12 == 1:
+            log.warning("API poll error (repeated %dx): %s", _poll_error_count, error_msg)
+    else:
+        _last_poll_error = error_msg
+        _poll_error_count = 1
+        log.warning("API poll error: %s", error_msg)
 
 
 def start_poller():
@@ -882,12 +1051,11 @@ def stop_poller():
 # ---------------------------------------------------------------------------
 
 def on_connect(client, userdata, flags, rc, properties=None):
-    global mqtt_connected, mqtt_reconnect_delay
+    global mqtt_connected
     if rc == 0:
         topic = f"{config.get('mqtt', {}).get('topic_prefix', 'frigate')}/reviews"
         client.subscribe(topic)
         mqtt_connected = True
-        mqtt_reconnect_delay = 1
         log.info("MQTT connected, subscribed to %s", topic)
     else:
         mqtt_connected = False
@@ -939,13 +1107,13 @@ def on_message(client, userdata, msg):
                 threading.Thread(target=process_phase2, args=(review_id,), daemon=True).start()
 
     except json.JSONDecodeError:
-        pass
+        log.warning("MQTT: received invalid JSON")
     except Exception as e:
         log.error("MQTT message processing error: %s", e)
 
 
 def start_mqtt():
-    global mqtt_client, mqtt_reconnect_delay
+    global mqtt_client
     import paho.mqtt.client as mqtt
 
     mqtt_conf = config.get("mqtt", {})
@@ -1020,8 +1188,9 @@ video,img{{width:100%;display:block}}
 def build_event_page(event_id):
     frigate_url = config.get("frigate", {}).get("url", "http://frigate:5000")
     frigate_public = config.get("frigate", {}).get("public_url", "")
+    session = _get_session()
     try:
-        resp = requests.get(f"{frigate_url}/api/events/{event_id}", timeout=10)
+        resp = session.get(f"{frigate_url}/api/events/{event_id}", timeout=10)
         if resp.status_code != 200:
             return None
         event = resp.json()
@@ -1066,7 +1235,6 @@ def build_event_page(event_id):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global shutting_down
     load_config()
     init_db()
     cleanup_history()
@@ -1094,17 +1262,22 @@ async def lifespan(app: FastAPI):
     cleanup_thread = threading.Thread(target=run_cleanup_loop, daemon=True)
     cleanup_thread.start()
 
-    log.info("Frigate Alerts v2 started (MQTT=%s, poll=%ds)",
-             "enabled" if mqtt_connected or (mqtt_conf.get("enabled") and mqtt_conf.get("server")) else "disabled",
+    log.info("Frigate Alerts v2.1 started (MQTT=%s, poll=%ds)",
+             "enabled" if mqtt_conf.get("enabled") and mqtt_conf.get("server") else "disabled",
              config.get("poll_interval", 5))
     yield
 
     # Graceful shutdown
-    shutting_down = True
-    cleanup_running_flag = False
+    shutting_down.set()
     stop_poller()
     stop_mqtt()
     provider_pool.shutdown(wait=True, cancel_futures=True)
+    # Close HTTP session
+    if _http_session:
+        try:
+            _http_session.close()
+        except Exception:
+            pass
     log.info("Frigate Alerts shut down")
 
 
@@ -1152,14 +1325,18 @@ async def history(limit: int = 50):
 async def status():
     frigate_url = config.get("frigate", {}).get("url", "http://frigate:5000")
     frigate_ok = False
+    session = _get_session()
     try:
-        resp = requests.get(f"{frigate_url}/api/stats", timeout=5)
+        resp = session.get(f"{frigate_url}/api/stats", timeout=5)
         frigate_ok = resp.status_code == 200
     except Exception:
         pass
 
     mqtt_conf = config.get("mqtt", {})
     mqtt_enabled = bool(mqtt_conf.get("enabled") and mqtt_conf.get("server"))
+
+    with _stats_lock:
+        stats_copy = dict(stats)
 
     return {
         "mqtt_enabled": mqtt_enabled,
@@ -1170,7 +1347,7 @@ async def status():
         "snooze_remaining": max(0, int(snooze_until - time.time())) if is_snoozed() else 0,
         "quiet_hours_active": in_quiet_hours(),
         "pending_phase2": len(pending_phase2),
-        "stats": stats,
+        "stats": stats_copy,
     }
 
 
@@ -1208,8 +1385,9 @@ async def snooze_quick(minutes: int = 30):
 @app.post("/api/test")
 async def test_notification():
     frigate_url = config.get("frigate", {}).get("url", "http://frigate:5000")
+    session = _get_session()
     try:
-        resp = requests.get(f"{frigate_url}/api/events?limit=1&has_clip=1", timeout=10)
+        resp = session.get(f"{frigate_url}/api/events?limit=1&has_clip=1", timeout=10)
         events = resp.json()
         if not events:
             return {"status": "error", "message": "No events in Frigate"}
