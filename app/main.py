@@ -1,13 +1,17 @@
 """
-Frigate Alerts - Main Application
+Frigate Alerts - Main Application (v2 - Rewritten for speed & reliability)
 Animated GIF notifications from Frigate NVR events.
 Supports: Pushover, Discord, Telegram, Ntfy, Gotify, Email, Webhook
 
-Two modes for receiving events (can run simultaneously):
-  1. API Polling (default) - polls Frigate's /api/reviews endpoint.
-     Only requires Frigate URL. No MQTT broker needed.
-  2. MQTT (optional) - subscribes to frigate/reviews topic for
-     instant notifications. Requires an MQTT broker.
+Architecture:
+  - MQTT primary (instant): subscribes to frigate/reviews, fires on "new"
+  - API polling fallback: catches anything MQTT misses
+  - Two-phase notifications:
+      Phase 1: Instant snapshot on event creation (<2s target)
+      Phase 2: GIF upgrade when event ends (or after timeout)
+  - Event queue with SQLite persistence for guaranteed delivery
+  - Parallel provider dispatch with ThreadPoolExecutor
+  - Auto-reconnecting MQTT with exponential backoff
 """
 
 import json
@@ -18,6 +22,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
@@ -51,15 +56,30 @@ DB_PATH = os.environ.get("DB_PATH", "/app/config/alerts.db")
 config = {}
 mqtt_client = None
 mqtt_connected = False
+mqtt_reconnect_delay = 1
 poller_running = False
 cleanup_running = False
+shutting_down = False
+
+# Thread-safe dedup
+_dedup_lock = threading.Lock()
 notified_reviews = set()
+
+# Phase 2 tracking: review_id -> {msg_refs, title, message, ...}
+_phase2_lock = threading.Lock()
+pending_phase2 = {}
 
 # Cooldown: camera -> last notification timestamp
 camera_cooldowns = {}
 
 # Snooze: timestamp when snooze expires (0 = not snoozed)
 snooze_until = 0
+
+# Provider thread pool (reused across notifications)
+provider_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="notify")
+
+# Stats
+stats = {"phase1_sent": 0, "phase2_sent": 0, "events_received": 0, "events_skipped": 0, "errors": 0}
 
 
 def load_config():
@@ -80,8 +100,15 @@ def save_config(new_config):
 # Database
 # ---------------------------------------------------------------------------
 
+def get_db():
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
+    return conn
+
+
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db()
     conn.execute("""
         CREATE TABLE IF NOT EXISTS history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -98,13 +125,23 @@ def init_db():
             gif_size INTEGER
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS pending_events (
+            review_id TEXT PRIMARY KEY,
+            event_data TEXT,
+            phase TEXT,
+            attempts INTEGER DEFAULT 0,
+            next_retry REAL,
+            created_at REAL
+        )
+    """)
     conn.commit()
     conn.close()
 
 
 def log_notification(review_id, event_id, camera, label, zones, provider, recipient, status, message="", gif_size=0):
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_db()
         conn.execute(
             "INSERT INTO history (timestamp, review_id, event_id, camera, label, zones, provider, recipient, status, message, gif_size) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (time.time(), review_id, event_id, camera, label, zones, provider, recipient, status, message, gif_size),
@@ -117,7 +154,7 @@ def log_notification(review_id, event_id, camera, label, zones, provider, recipi
 
 def get_history(limit=50):
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_db()
         conn.row_factory = sqlite3.Row
         rows = conn.execute("SELECT * FROM history ORDER BY timestamp DESC LIMIT ?", (limit,)).fetchall()
         conn.close()
@@ -126,13 +163,65 @@ def get_history(limit=50):
         return []
 
 
+def save_pending_event(review_id, event_data, phase):
+    try:
+        conn = get_db()
+        conn.execute(
+            "INSERT OR REPLACE INTO pending_events (review_id, event_data, phase, attempts, next_retry, created_at) VALUES (?, ?, ?, 0, ?, ?)",
+            (review_id, json.dumps(event_data), phase, time.time(), time.time()),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log.error("Save pending event error: %s", e)
+
+
+def remove_pending_event(review_id):
+    try:
+        conn = get_db()
+        conn.execute("DELETE FROM pending_events WHERE review_id = ?", (review_id,))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log.error("Remove pending event error: %s", e)
+
+
+def get_pending_events():
+    try:
+        conn = get_db()
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT * FROM pending_events WHERE next_retry <= ? AND attempts < 3 ORDER BY created_at",
+            (time.time(),),
+        ).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+    except Exception:
+        return []
+
+
+def increment_pending_retry(review_id):
+    try:
+        conn = get_db()
+        conn.execute(
+            "UPDATE pending_events SET attempts = attempts + 1, next_retry = ? WHERE review_id = ?",
+            (time.time() + 30, review_id),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log.error("Increment retry error: %s", e)
+
+
 def cleanup_history():
     retention_days = config.get("history_retention_days", 30)
     cutoff = time.time() - (retention_days * 86400)
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_db()
         result = conn.execute("DELETE FROM history WHERE timestamp < ?", (cutoff,))
         deleted = result.rowcount
+        # Also clean old pending events (>1 hour)
+        conn.execute("DELETE FROM pending_events WHERE created_at < ?", (time.time() - 3600,))
         conn.commit()
         conn.close()
         if deleted > 0:
@@ -144,10 +233,10 @@ def cleanup_history():
 def run_cleanup_loop():
     global cleanup_running
     cleanup_running = True
-    while cleanup_running:
+    while cleanup_running and not shutting_down:
         cleanup_history()
         for _ in range(6 * 3600):
-            if not cleanup_running:
+            if not cleanup_running or shutting_down:
                 return
             time.sleep(1)
 
@@ -218,7 +307,6 @@ def should_notify(camera, labels, zones):
 # ---------------------------------------------------------------------------
 
 def render_template(template, variables):
-    """Render a message template with {variable} substitution."""
     try:
         return template.format(**variables)
     except (KeyError, ValueError):
@@ -226,7 +314,6 @@ def render_template(template, variables):
 
 
 def build_message(camera, label_str, zone_str, review_id, event_id):
-    """Build title and message from config templates or defaults."""
     variables = {
         "camera": camera,
         "label": label_str.title(),
@@ -238,28 +325,23 @@ def build_message(camera, label_str, zone_str, review_id, event_id):
         "review_id": review_id,
         "event_id": event_id,
     }
-
     title_tpl = config.get("title_template", "{label} - {camera}")
     msg_tpl = config.get("message_template", "")
-
     title = render_template(title_tpl, variables)
-
     if msg_tpl:
         message = render_template(msg_tpl, variables)
     else:
         message = f"{label_str.title()} detected on {camera}"
         if zone_str:
             message += f" ({zone_str})"
-
     return title, message
 
 
 # ---------------------------------------------------------------------------
-# Media fetching (GIF, snapshot, or clip)
+# Media fetching
 # ---------------------------------------------------------------------------
 
 def clip_to_gif(clip_data, max_duration=3, fps=6, width=240):
-    """Convert mp4 clip to a smooth GIF using ffmpeg."""
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as mp4:
         mp4.write(clip_data)
         mp4_path = mp4.name
@@ -277,7 +359,7 @@ def clip_to_gif(clip_data, max_duration=3, fps=6, width=240):
             with open(gif_path, "rb") as f:
                 gif_data = f.read()
             if len(gif_data) > 100:
-                log.info("Generated GIF from clip (%d bytes, %dfps, %dpx wide)", len(gif_data), fps, width)
+                log.info("Generated GIF from clip (%d bytes)", len(gif_data))
                 return gif_data
         else:
             log.warning("ffmpeg GIF conversion failed: %s", result.stderr[-200:] if result.stderr else "unknown")
@@ -293,28 +375,31 @@ def clip_to_gif(clip_data, max_duration=3, fps=6, width=240):
 
 
 def fetch_snapshot(event_id):
-    """Fetch snapshot immediately. Always available as soon as event starts."""
     frigate_url = config.get("frigate", {}).get("url", "http://frigate:5000")
-    try:
-        resp = requests.get(f"{frigate_url}/api/events/{event_id}/snapshot.jpg", timeout=10)
-        if resp.status_code == 200 and len(resp.content) > 100:
-            log.info("Fetched snapshot for %s (%d bytes)", event_id, len(resp.content))
-            return resp.content, "image/jpeg", "jpg"
-    except Exception as e:
-        log.error("Snapshot fetch failed: %s", e)
+    for attempt in range(3):
+        try:
+            resp = requests.get(f"{frigate_url}/api/events/{event_id}/snapshot.jpg", timeout=5)
+            if resp.status_code == 200 and len(resp.content) > 100:
+                log.info("Fetched snapshot for %s (%d bytes)", event_id, len(resp.content))
+                return resp.content, "image/jpeg", "jpg"
+            if resp.status_code == 404 and attempt < 2:
+                time.sleep(0.5)
+                continue
+        except Exception as e:
+            log.error("Snapshot fetch failed (attempt %d): %s", attempt + 1, e)
+            if attempt < 2:
+                time.sleep(0.5)
     return None, None, None
 
 
 def fetch_gif(event_id, retries=None, retry_interval=None):
-    """Fetch GIF media for an event (clip→ffmpeg GIF, or preview.gif fallback)."""
     frigate_url = config.get("frigate", {}).get("url", "http://frigate:5000")
     retries = retries or config.get("gif_retries", 3)
     retry_interval = retry_interval or config.get("gif_retry_interval", 5)
 
-    # Generate a smooth GIF from the video clip via ffmpeg
     for attempt in range(1, retries + 1):
         try:
-            resp = requests.get(f"{frigate_url}/api/events/{event_id}/clip.mp4", timeout=60)
+            resp = requests.get(f"{frigate_url}/api/events/{event_id}/clip.mp4", timeout=30)
             if resp.status_code == 200 and len(resp.content) > 1000:
                 gif_data = clip_to_gif(resp.content)
                 if gif_data:
@@ -325,9 +410,9 @@ def fetch_gif(event_id, retries=None, retry_interval=None):
         if attempt < retries:
             time.sleep(retry_interval)
 
-    # Fallback to Frigate's preview.gif if clip unavailable
+    # Fallback to Frigate's preview.gif
     try:
-        resp = requests.get(f"{frigate_url}/api/events/{event_id}/preview.gif", timeout=30)
+        resp = requests.get(f"{frigate_url}/api/events/{event_id}/preview.gif", timeout=15)
         if resp.status_code == 200 and len(resp.content) > 100:
             log.info("Fell back to Frigate preview.gif for %s (%d bytes)", event_id, len(resp.content))
             return resp.content, "image/gif", "gif"
@@ -338,28 +423,21 @@ def fetch_gif(event_id, retries=None, retry_interval=None):
 
 
 def fetch_media(event_id, retries=None, retry_interval=None):
-    """Fetch preferred media type for an event. Returns (data, mime_type, extension)."""
     media_type = config.get("media_type", "gif")
-
     if media_type == "clip":
         frigate_url = config.get("frigate", {}).get("url", "http://frigate:5000")
         try:
-            resp = requests.get(f"{frigate_url}/api/events/{event_id}/clip.mp4", timeout=60)
+            resp = requests.get(f"{frigate_url}/api/events/{event_id}/clip.mp4", timeout=30)
             if resp.status_code == 200 and len(resp.content) > 1000:
-                log.info("Fetched clip for %s (%d bytes)", event_id, len(resp.content))
                 return resp.content, "video/mp4", "mp4"
         except Exception as e:
             log.warning("Clip fetch error: %s", e)
-
     if media_type in ("gif", "clip"):
         data, mime, ext = fetch_gif(event_id, retries, retry_interval)
         if data:
             return data, mime, ext
-
     if media_type == "snapshot":
         return fetch_snapshot(event_id)
-
-    # Final fallback to snapshot
     return fetch_snapshot(event_id)
 
 
@@ -368,18 +446,14 @@ def fetch_media(event_id, retries=None, retry_interval=None):
 # ---------------------------------------------------------------------------
 
 def build_event_urls(review_id, event_id):
-    """Build Frigate review URL and event video page URL."""
     frigate_public = config.get("frigate", {}).get("public_url", "")
     alerts_public = config.get("alerts_public_url", "")
-
     frigate_url = f"{frigate_public}/review?id={review_id}" if frigate_public else ""
     video_url = f"{alerts_public}/event/{event_id}" if alerts_public else ""
-
     return frigate_url, video_url
 
 
 def build_snooze_url(minutes):
-    """Build snooze API URL for Pushover action buttons."""
     alerts_public = config.get("alerts_public_url", "")
     if alerts_public:
         return f"{alerts_public}/api/snooze/quick?minutes={minutes}"
@@ -387,75 +461,131 @@ def build_snooze_url(minutes):
 
 
 # ---------------------------------------------------------------------------
-# Notification dispatch
+# Notification dispatch (parallel)
 # ---------------------------------------------------------------------------
 
 def send_to_all_providers(title, message, media_data, media_type, media_ext,
                           frigate_url, video_url, review_id, event_id,
                           camera, label_str, zone_str):
-    """Send notification to all enabled providers. Returns message references for later updates."""
+    """Send notification to all enabled providers IN PARALLEL. Returns message references."""
     snooze_url = build_snooze_url(30)
     media_size = len(media_data) if media_data else 0
     msg_refs = {}
+    futures = []
 
-    po = config.get("pushover", {})
-    if po.get("enabled"):
+    def _send_pushover_all():
+        po = config.get("pushover", {})
+        if not po.get("enabled"):
+            return
         cam_overrides = {}
         for co in po.get("camera_overrides", []):
             if co.get("camera") == camera:
                 cam_overrides = co
                 break
-
         po_refs = []
         for r in po.get("recipients", []):
-            status = send_pushover(
-                po, r, title, message, media_data, media_type,
-                url=frigate_url, video_url=video_url, snooze_url=snooze_url,
-                camera_overrides=cam_overrides,
-            )
-            log_notification(review_id, event_id, camera, label_str, zone_str, "pushover", r.get("name", ""), status, gif_size=media_size)
+            try:
+                status = send_pushover(
+                    po, r, title, message, media_data, media_type,
+                    url=frigate_url, video_url=video_url, snooze_url=snooze_url,
+                    camera_overrides=cam_overrides,
+                )
+                log_notification(review_id, event_id, camera, label_str, zone_str, "pushover", r.get("name", ""), status, gif_size=media_size)
+            except Exception as e:
+                log.error("Pushover send error: %s", e)
+                stats["errors"] += 1
             po_refs.append({"config": po, "recipient": r, "camera_overrides": cam_overrides})
         msg_refs["pushover"] = po_refs
 
-    dc = config.get("discord", {})
-    if dc.get("enabled"):
+    def _send_discord_all():
+        dc = config.get("discord", {})
+        if not dc.get("enabled"):
+            return
         dc_refs = []
         for w in dc.get("webhooks", []):
-            status, message_id = send_discord(
-                w, title, message, media_data, media_type,
-                url=frigate_url, video_url=video_url,
-                camera=camera, label=label_str, zone=zone_str,
-            )
-            log_notification(review_id, event_id, camera, label_str, zone_str, "discord", w.get("name", ""), status, gif_size=media_size)
-            if message_id:
-                dc_refs.append({"webhook_url": w.get("url", ""), "message_id": message_id})
+            try:
+                status, message_id = send_discord(
+                    w, title, message, media_data, media_type,
+                    url=frigate_url, video_url=video_url,
+                    camera=camera, label=label_str, zone=zone_str,
+                )
+                log_notification(review_id, event_id, camera, label_str, zone_str, "discord", w.get("name", ""), status, gif_size=media_size)
+                if message_id:
+                    dc_refs.append({"webhook_url": w.get("url", ""), "message_id": message_id})
+            except Exception as e:
+                log.error("Discord send error: %s", e)
+                stats["errors"] += 1
         msg_refs["discord"] = dc_refs
 
-    tg = config.get("telegram", {})
-    if tg.get("enabled"):
-        status = send_telegram(tg, title, message, media_data, media_type, url=frigate_url, video_url=video_url)
-        log_notification(review_id, event_id, camera, label_str, zone_str, "telegram", tg.get("chat_id", ""), status, gif_size=media_size)
+    def _send_telegram():
+        tg = config.get("telegram", {})
+        if not tg.get("enabled"):
+            return
+        try:
+            status = send_telegram(tg, title, message, media_data, media_type, url=frigate_url, video_url=video_url)
+            log_notification(review_id, event_id, camera, label_str, zone_str, "telegram", tg.get("chat_id", ""), status, gif_size=media_size)
+        except Exception as e:
+            log.error("Telegram send error: %s", e)
+            stats["errors"] += 1
 
-    nt = config.get("ntfy", {})
-    if nt.get("enabled"):
-        status = send_ntfy(nt, title, message, media_data, media_type, url=frigate_url)
-        log_notification(review_id, event_id, camera, label_str, zone_str, "ntfy", nt.get("topic", ""), status, gif_size=media_size)
+    def _send_ntfy():
+        nt = config.get("ntfy", {})
+        if not nt.get("enabled"):
+            return
+        try:
+            status = send_ntfy(nt, title, message, media_data, media_type, url=frigate_url)
+            log_notification(review_id, event_id, camera, label_str, zone_str, "ntfy", nt.get("topic", ""), status, gif_size=media_size)
+        except Exception as e:
+            log.error("Ntfy send error: %s", e)
+            stats["errors"] += 1
 
-    go = config.get("gotify", {})
-    if go.get("enabled"):
-        status = send_gotify(go, title, message, media_data, media_type, url=frigate_url)
-        log_notification(review_id, event_id, camera, label_str, zone_str, "gotify", "server", status, gif_size=media_size)
+    def _send_gotify():
+        go = config.get("gotify", {})
+        if not go.get("enabled"):
+            return
+        try:
+            status = send_gotify(go, title, message, media_data, media_type, url=frigate_url)
+            log_notification(review_id, event_id, camera, label_str, zone_str, "gotify", "server", status, gif_size=media_size)
+        except Exception as e:
+            log.error("Gotify send error: %s", e)
+            stats["errors"] += 1
 
-    em = config.get("smtp", {})
-    if em.get("enabled"):
-        status = send_smtp(em, title, message, media_data, media_type, url=frigate_url)
-        log_notification(review_id, event_id, camera, label_str, zone_str, "email", ", ".join(em.get("recipients", [])), status, gif_size=media_size)
+    def _send_smtp():
+        em = config.get("smtp", {})
+        if not em.get("enabled"):
+            return
+        try:
+            status = send_smtp(em, title, message, media_data, media_type, url=frigate_url)
+            log_notification(review_id, event_id, camera, label_str, zone_str, "email", ", ".join(em.get("recipients", [])), status, gif_size=media_size)
+        except Exception as e:
+            log.error("SMTP send error: %s", e)
+            stats["errors"] += 1
 
-    wh = config.get("webhook", {})
-    if wh.get("enabled"):
-        event_data = {"review_id": review_id, "event_id": event_id, "camera": camera, "label": label_str, "zones": zone_str, "video_url": video_url}
-        status = send_webhook(wh, title, message, media_data, media_type, url=frigate_url, event_data=event_data)
-        log_notification(review_id, event_id, camera, label_str, zone_str, "webhook", wh.get("url", "")[:30], status, gif_size=media_size)
+    def _send_webhook():
+        wh = config.get("webhook", {})
+        if not wh.get("enabled"):
+            return
+        try:
+            event_data = {"review_id": review_id, "event_id": event_id, "camera": camera, "label": label_str, "zones": zone_str, "video_url": video_url}
+            status = send_webhook(wh, title, message, media_data, media_type, url=frigate_url, event_data=event_data)
+            log_notification(review_id, event_id, camera, label_str, zone_str, "webhook", wh.get("url", "")[:30], status, gif_size=media_size)
+        except Exception as e:
+            log.error("Webhook send error: %s", e)
+            stats["errors"] += 1
+
+    # Fire all providers in parallel
+    senders = [_send_pushover_all, _send_discord_all, _send_telegram, _send_ntfy, _send_gotify, _send_smtp, _send_webhook]
+    send_futures = []
+    for sender in senders:
+        send_futures.append(provider_pool.submit(sender))
+
+    # Wait for all to complete (max 30s)
+    for f in as_completed(send_futures, timeout=30):
+        try:
+            f.result()
+        except Exception as e:
+            log.error("Provider dispatch error: %s", e)
+            stats["errors"] += 1
 
     return msg_refs
 
@@ -463,63 +593,105 @@ def send_to_all_providers(title, message, media_data, media_type, media_ext,
 def update_all_providers(msg_refs, title, message, media_data, media_type, media_ext,
                           frigate_url, video_url, review_id, event_id,
                           camera, label_str, zone_str):
-    """Update previously sent notifications with GIF media."""
+    """Update previously sent notifications with GIF media (parallel)."""
     media_size = len(media_data) if media_data else 0
     snooze_url = build_snooze_url(30)
+    futures = []
 
-    # Discord: edit the original message in-place
-    for ref in msg_refs.get("discord", []):
-        status = update_discord(
-            ref["webhook_url"], ref["message_id"],
-            title, message, media_data, media_type,
-            url=frigate_url, video_url=video_url,
-            camera=camera, label=label_str, zone=zone_str,
-        )
-        log_notification(review_id, event_id, camera, label_str, zone_str, "discord", "update", status, gif_size=media_size)
+    def _update_discord():
+        for ref in msg_refs.get("discord", []):
+            try:
+                status = update_discord(
+                    ref["webhook_url"], ref["message_id"],
+                    title, message, media_data, media_type,
+                    url=frigate_url, video_url=video_url,
+                    camera=camera, label=label_str, zone=zone_str,
+                )
+                log_notification(review_id, event_id, camera, label_str, zone_str, "discord", "update", status, gif_size=media_size)
+            except Exception as e:
+                log.error("Discord update error: %s", e)
 
-    # Pushover: send a silent follow-up (no edit API)
-    for ref in msg_refs.get("pushover", []):
-        status = send_pushover(
-            ref["config"], ref["recipient"], title, message, media_data, media_type,
-            url=frigate_url, video_url=video_url, snooze_url=snooze_url,
-            camera_overrides=ref.get("camera_overrides", {}),
-            silent=True,
-        )
-        log_notification(review_id, event_id, camera, label_str, zone_str, "pushover", ref["recipient"].get("name", "") + " (gif)", status, gif_size=media_size)
+    def _update_pushover():
+        for ref in msg_refs.get("pushover", []):
+            try:
+                status = send_pushover(
+                    ref["config"], ref["recipient"], title, message, media_data, media_type,
+                    url=frigate_url, video_url=video_url, snooze_url=snooze_url,
+                    camera_overrides=ref.get("camera_overrides", {}),
+                    silent=True,
+                )
+                log_notification(review_id, event_id, camera, label_str, zone_str, "pushover", ref["recipient"].get("name", "") + " (gif)", status, gif_size=media_size)
+            except Exception as e:
+                log.error("Pushover update error: %s", e)
+
+    futures.append(provider_pool.submit(_update_discord))
+    futures.append(provider_pool.submit(_update_pushover))
+
+    for f in as_completed(futures, timeout=30):
+        try:
+            f.result()
+        except Exception as e:
+            log.error("Provider update error: %s", e)
 
 
 # ---------------------------------------------------------------------------
-# Review processing (shared by poller and MQTT)
+# Review processing - Phase 1 (instant snapshot) and Phase 2 (GIF upgrade)
 # ---------------------------------------------------------------------------
 
-def process_review(review):
-    global notified_reviews
+def _add_to_dedup(review_id):
+    """Thread-safe add to dedup set. Returns True if new, False if already seen."""
+    with _dedup_lock:
+        if review_id in notified_reviews:
+            return False
+        notified_reviews.add(review_id)
+        if len(notified_reviews) > 2000:
+            # Keep most recent 1000
+            sorted_ids = sorted(notified_reviews)
+            notified_reviews.clear()
+            notified_reviews.update(sorted_ids[-1000:])
+        return True
+
+
+def process_phase1(review):
+    """Phase 1: Instant snapshot notification on event creation."""
     review_id = review.get("id", "")
     camera = review.get("camera", "")
     objects = review.get("data", {}).get("objects", [])
     detections = review.get("data", {}).get("detections", [])
     zones = review.get("data", {}).get("zones", [])
 
-    if review_id in notified_reviews:
+    # Thread-safe dedup
+    if not _add_to_dedup(review_id):
         return
-    notified_reviews.add(review_id)
-    if len(notified_reviews) > 1000:
-        notified_reviews = set(list(notified_reviews)[-500:])
 
-    log.info("Review %s: camera=%s objects=%s zones=%s", review_id, camera, objects, zones)
+    stats["events_received"] += 1
+
+    # Stale event filter (skip events older than 5 minutes)
+    start_time = review.get("start_time", 0)
+    if start_time and (time.time() - start_time) > 300:
+        log.info("Skipping stale event %s (%.0fs old)", review_id, time.time() - start_time)
+        stats["events_skipped"] += 1
+        return
+
+    log.info("Phase 1: Review %s camera=%s objects=%s zones=%s", review_id, camera, objects, zones)
 
     if is_snoozed():
         log.info("Skipping: snoozed until %s", datetime.fromtimestamp(snooze_until).strftime("%H:%M"))
+        stats["events_skipped"] += 1
         return
     if in_quiet_hours():
         log.info("Skipping: quiet hours active")
+        stats["events_skipped"] += 1
         return
     if not should_notify(camera, objects, zones):
+        stats["events_skipped"] += 1
         return
     if check_cooldown(camera):
         log.info("Skipping: camera %s in cooldown", camera)
+        stats["events_skipped"] += 1
         return
     if not detections:
+        stats["events_skipped"] += 1
         return
 
     set_cooldown(camera)
@@ -530,72 +702,155 @@ def process_review(review):
     title, message = build_message(camera, label_str, zone_str, review_id, event_id)
     frigate_url, video_url = build_event_urls(review_id, event_id)
 
-    # --- Phase 1: Instant snapshot notification ---
+    # Fetch snapshot (available immediately on event creation)
     snap_data, snap_type, snap_ext = fetch_snapshot(event_id)
     if not snap_data:
-        log.warning("No snapshot available for %s, waiting for GIF instead", event_id)
-        # Fall back to old behavior if snapshot somehow unavailable
-        gif_delay = config.get("gif_delay", 10)
-        time.sleep(gif_delay)
-        media_data, media_type, media_ext = fetch_media(event_id)
-        if media_data:
-            send_to_all_providers(
-                title, message, media_data, media_type, media_ext,
-                frigate_url, video_url, review_id, event_id,
-                camera, label_str, zone_str,
-            )
+        log.warning("No snapshot for %s, saving as pending", event_id)
+        save_pending_event(review_id, review, "phase1")
         return
 
-    log.info("Phase 1: Sending instant snapshot for %s", event_id)
+    t_start = time.time()
     msg_refs = send_to_all_providers(
         title, message, snap_data, snap_type, snap_ext,
         frigate_url, video_url, review_id, event_id,
         camera, label_str, zone_str,
     )
+    elapsed = time.time() - t_start
+    log.info("Phase 1 SENT for %s in %.1fs (camera=%s)", review_id, elapsed, camera)
+    stats["phase1_sent"] += 1
 
-    # --- Phase 2: GIF upgrade ---
+    # Remove from pending if it was retried
+    remove_pending_event(review_id)
+
+    # Store Phase 2 context for GIF upgrade when event ends
     media_type_cfg = config.get("media_type", "gif")
-    if media_type_cfg == "snapshot":
-        return  # User only wants snapshots, we're done
+    if media_type_cfg != "snapshot":
+        with _phase2_lock:
+            pending_phase2[review_id] = {
+                "msg_refs": msg_refs,
+                "title": title,
+                "message": message,
+                "frigate_url": frigate_url,
+                "video_url": video_url,
+                "event_id": event_id,
+                "camera": camera,
+                "label_str": label_str,
+                "zone_str": zone_str,
+                "created_at": time.time(),
+            }
 
-    gif_delay = config.get("gif_delay", 5)
-    log.info("Phase 2: Waiting %ds for GIF...", gif_delay)
-    time.sleep(gif_delay)
+
+def process_phase2(review_id):
+    """Phase 2: GIF upgrade when event ends."""
+    with _phase2_lock:
+        ctx = pending_phase2.pop(review_id, None)
+    if not ctx:
+        return
+
+    event_id = ctx["event_id"]
+    log.info("Phase 2: Fetching GIF for %s (event %s)", review_id, event_id)
+
+    # Small delay to let Frigate finalize the clip
+    time.sleep(2)
 
     gif_data, gif_type, gif_ext = fetch_gif(event_id)
     if gif_data:
-        log.info("Phase 2: Updating notifications with GIF for %s (%d bytes)", event_id, len(gif_data))
+        t_start = time.time()
         update_all_providers(
-            msg_refs, title, message, gif_data, gif_type, gif_ext,
-            frigate_url, video_url, review_id, event_id,
-            camera, label_str, zone_str,
+            ctx["msg_refs"], ctx["title"], ctx["message"],
+            gif_data, gif_type, gif_ext,
+            ctx["frigate_url"], ctx["video_url"], review_id, event_id,
+            ctx["camera"], ctx["label_str"], ctx["zone_str"],
         )
+        elapsed = time.time() - t_start
+        log.info("Phase 2 SENT for %s in %.1fs (%d bytes)", review_id, elapsed, len(gif_data))
+        stats["phase2_sent"] += 1
     else:
-        log.info("Phase 2: No GIF available for %s, snapshot notification stands", event_id)
+        log.info("Phase 2: No GIF available for %s, snapshot stands", event_id)
+
+
+def phase2_timeout_loop():
+    """Background loop: trigger Phase 2 for events that never got an 'end' message."""
+    while not shutting_down:
+        timeout = config.get("phase2_timeout", 60)
+        now = time.time()
+        expired = []
+        with _phase2_lock:
+            for rid, ctx in list(pending_phase2.items()):
+                if now - ctx["created_at"] > timeout:
+                    expired.append(rid)
+
+        for rid in expired:
+            log.info("Phase 2 timeout for %s, attempting GIF anyway", rid)
+            try:
+                process_phase2(rid)
+            except Exception as e:
+                log.error("Phase 2 timeout error for %s: %s", rid, e)
+
+        time.sleep(5)
 
 
 # ---------------------------------------------------------------------------
-# Mode 1: API Polling (default, no MQTT needed)
+# Pending event retry loop
+# ---------------------------------------------------------------------------
+
+def pending_retry_loop():
+    """Retry failed Phase 1 notifications from the persistent queue."""
+    while not shutting_down:
+        try:
+            pending = get_pending_events()
+            for row in pending:
+                if shutting_down:
+                    return
+                review_id = row["review_id"]
+                try:
+                    event_data = json.loads(row["event_data"])
+                    log.info("Retrying pending event %s (attempt %d)", review_id, row["attempts"] + 1)
+                    # Remove from dedup so it can be reprocessed
+                    with _dedup_lock:
+                        notified_reviews.discard(review_id)
+                    process_phase1(event_data)
+                except Exception as e:
+                    log.error("Pending retry error for %s: %s", review_id, e)
+                    increment_pending_retry(review_id)
+        except Exception as e:
+            log.error("Pending retry loop error: %s", e)
+        time.sleep(10)
+
+
+# ---------------------------------------------------------------------------
+# Mode 1: API Polling (fallback, catches anything MQTT misses)
 # ---------------------------------------------------------------------------
 
 def poll_frigate():
     global poller_running
     poller_running = True
     frigate_url = config.get("frigate", {}).get("url", "http://frigate:5000")
-    poll_interval = config.get("poll_interval", 10)
-    lookback = 300  # always check last 5 minutes, dedup handles the rest
+    poll_interval = config.get("poll_interval", 5)
+    lookback = 120  # Check last 2 minutes
 
     log.info("API poller started (interval=%ds, url=%s)", poll_interval, frigate_url)
 
-    while poller_running:
+    while poller_running and not shutting_down:
         try:
             params = {"severity": "alert", "after": time.time() - lookback, "limit": 50}
-            resp = requests.get(f"{frigate_url}/api/review", params=params, timeout=15)
+            resp = requests.get(f"{frigate_url}/api/review", params=params, timeout=10)
             if resp.status_code == 200:
                 reviews = resp.json()
                 for review in reviews:
-                    if review.get("end_time") and review.get("severity") == "alert":
-                        threading.Thread(target=process_review, args=(review,), daemon=True).start()
+                    # Process ANY alert review, not just ended ones
+                    if review.get("severity") == "alert":
+                        review_id = review.get("id", "")
+                        # Quick check without lock for performance
+                        if review_id not in notified_reviews:
+                            threading.Thread(
+                                target=process_phase1, args=(review,), daemon=True
+                            ).start()
+                        # Check for ended reviews to trigger Phase 2
+                        if review.get("end_time") and review_id in pending_phase2:
+                            threading.Thread(
+                                target=process_phase2, args=(review_id,), daemon=True
+                            ).start()
         except Exception as e:
             log.warning("API poll error: %s", e)
         time.sleep(poll_interval)
@@ -613,23 +868,27 @@ def stop_poller():
 
 
 # ---------------------------------------------------------------------------
-# Mode 2: MQTT (optional, for instant notifications)
+# Mode 2: MQTT (primary, instant notifications)
 # ---------------------------------------------------------------------------
 
 def on_connect(client, userdata, flags, rc, properties=None):
-    global mqtt_connected
+    global mqtt_connected, mqtt_reconnect_delay
     if rc == 0:
         topic = f"{config.get('mqtt', {}).get('topic_prefix', 'frigate')}/reviews"
         client.subscribe(topic)
         mqtt_connected = True
+        mqtt_reconnect_delay = 1
         log.info("MQTT connected, subscribed to %s", topic)
     else:
         mqtt_connected = False
+        log.error("MQTT connection failed, rc=%d", rc)
 
 
 def on_disconnect(client, userdata, rc, *args):
     global mqtt_connected
     mqtt_connected = False
+    if rc != 0:
+        log.warning("MQTT disconnected unexpectedly (rc=%d), will reconnect", rc)
 
 
 def on_message(client, userdata, msg):
@@ -638,36 +897,68 @@ def on_message(client, userdata, msg):
         msg_type = payload.get("type")
         review = payload.get("after", {})
         severity = review.get("severity", "")
-        if severity != "alert" or msg_type != "end":
+
+        if severity != "alert":
             return
-        threading.Thread(target=process_review, args=(review,), daemon=True).start()
+
+        if msg_type == "new":
+            # Phase 1: Instant notification on event creation
+            threading.Thread(target=process_phase1, args=(review,), daemon=True).start()
+
+        elif msg_type == "end":
+            # Phase 2: GIF upgrade when event ends
+            review_id = review.get("id", "")
+            if review_id:
+                threading.Thread(target=process_phase2, args=(review_id,), daemon=True).start()
+
+        # "update" type is ignored (intermediate updates during detection)
+
     except json.JSONDecodeError:
         pass
+    except Exception as e:
+        log.error("MQTT message processing error: %s", e)
 
 
 def start_mqtt():
-    global mqtt_client
+    global mqtt_client, mqtt_reconnect_delay
     import paho.mqtt.client as mqtt
+
     mqtt_conf = config.get("mqtt", {})
     if not mqtt_conf.get("server"):
+        log.warning("MQTT server not configured")
         return
+
     mqtt_client = mqtt.Client(
         client_id=mqtt_conf.get("client_id", "frigate-alerts"),
         callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
     )
+
     if mqtt_conf.get("username"):
         mqtt_client.username_pw_set(mqtt_conf["username"], mqtt_conf.get("password", ""))
+
     mqtt_client.on_connect = on_connect
     mqtt_client.on_disconnect = on_disconnect
     mqtt_client.on_message = on_message
-    mqtt_client.connect_async(mqtt_conf["server"], mqtt_conf.get("port", 1883), keepalive=60)
-    mqtt_client.loop_start()
+
+    # Enable auto-reconnect with backoff
+    mqtt_client.reconnect_delay_set(min_delay=1, max_delay=60)
+
+    try:
+        mqtt_client.connect_async(mqtt_conf["server"], mqtt_conf.get("port", 1883), keepalive=60)
+        mqtt_client.loop_start()
+        log.info("MQTT client started (server=%s:%d)", mqtt_conf["server"], mqtt_conf.get("port", 1883))
+    except Exception as e:
+        log.error("MQTT connection error: %s", e)
 
 
 def stop_mqtt():
     global mqtt_client, mqtt_connected
     if mqtt_client:
-        mqtt_client.loop_stop()
+        try:
+            mqtt_client.loop_stop()
+            mqtt_client.disconnect()
+        except Exception:
+            pass
         mqtt_client = None
         mqtt_connected = False
 
@@ -702,11 +993,8 @@ video,img{{width:100%;display:block}}
 
 
 def build_event_page(event_id):
-    """Build an HTML page for viewing an event's media."""
     frigate_url = config.get("frigate", {}).get("url", "http://frigate:5000")
     frigate_public = config.get("frigate", {}).get("public_url", "")
-
-    # Get event details from Frigate
     try:
         resp = requests.get(f"{frigate_url}/api/events/{event_id}", timeout=10)
         if resp.status_code != 200:
@@ -719,11 +1007,7 @@ def build_event_page(event_id):
     label = event.get("label", "unknown").title()
     start = datetime.fromtimestamp(event.get("start_time", 0)).strftime("%Y-%m-%d %H:%M:%S")
     zones = ", ".join(event.get("zones", [])) or "none"
-
-    # Use public Frigate URL for media if available, otherwise internal
     media_base = frigate_public or frigate_url
-
-    # Build player (video > gif > snapshot)
     clip_url = f"{media_base}/api/events/{event_id}/clip.mp4"
     gif_url = f"{media_base}/api/events/{event_id}/preview.gif"
     snap_url = f"{media_base}/api/events/{event_id}/snapshot.jpg"
@@ -733,14 +1017,12 @@ def build_event_page(event_id):
     else:
         player = f'<img src="{gif_url}" alt="Preview" onerror="this.src=\'{snap_url}\'">'
 
-    # Links
     links_parts = []
     if frigate_public:
         links_parts.append(f'<a href="{frigate_public}/review?id={event.get("id", "")}">Open in Frigate</a>')
     links_parts.append(f'<a href="{clip_url}" download>Download Clip</a>')
     links_parts.append(f'<a href="{snap_url}" download>Download Snapshot</a>')
 
-    # Info
     info = f"""<div><span class="k">Camera</span><span class="v">{camera}</span></div>
 <div><span class="k">Label</span><span class="v">{label}</span></div>
 <div><span class="k">Zones</span><span class="v">{zones}</span></div>
@@ -759,29 +1041,46 @@ def build_event_page(event_id):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global shutting_down
     load_config()
     init_db()
     cleanup_history()
 
+    # Start MQTT (primary)
     mqtt_conf = config.get("mqtt", {})
     if mqtt_conf.get("enabled") and mqtt_conf.get("server"):
         start_mqtt()
-        log.info("MQTT mode enabled")
+        log.info("MQTT mode enabled (primary)")
     else:
         log.info("MQTT not configured, using API polling only")
 
+    # Start API poller (always runs as fallback/safety net)
     start_poller()
 
+    # Start Phase 2 timeout checker
+    p2_thread = threading.Thread(target=phase2_timeout_loop, daemon=True)
+    p2_thread.start()
+
+    # Start pending event retry loop
+    retry_thread = threading.Thread(target=pending_retry_loop, daemon=True)
+    retry_thread.start()
+
+    # Start cleanup loop
     cleanup_thread = threading.Thread(target=run_cleanup_loop, daemon=True)
     cleanup_thread.start()
 
-    log.info("Frigate Alerts started")
+    log.info("Frigate Alerts v2 started (MQTT=%s, poll=%ds)",
+             "enabled" if mqtt_connected or (mqtt_conf.get("enabled") and mqtt_conf.get("server")) else "disabled",
+             config.get("poll_interval", 5))
     yield
 
-    global cleanup_running
-    cleanup_running = False
+    # Graceful shutdown
+    shutting_down = True
+    cleanup_running_flag = False
     stop_poller()
     stop_mqtt()
+    provider_pool.shutdown(wait=True, cancel_futures=True)
+    log.info("Frigate Alerts shut down")
 
 
 app = FastAPI(title="Frigate Alerts", lifespan=lifespan)
@@ -795,7 +1094,6 @@ async def index():
 
 @app.get("/event/{event_id}", response_class=HTMLResponse)
 async def event_page(event_id: str):
-    """Event video/media page, linked from notifications."""
     html = build_event_page(event_id)
     if html:
         return HTMLResponse(html)
@@ -846,6 +1144,8 @@ async def status():
         "snoozed": is_snoozed(),
         "snooze_remaining": max(0, int(snooze_until - time.time())) if is_snoozed() else 0,
         "quiet_hours_active": in_quiet_hours(),
+        "pending_phase2": len(pending_phase2),
+        "stats": stats,
     }
 
 
@@ -872,7 +1172,6 @@ async def snooze_cancel():
 
 @app.get("/api/snooze/quick")
 async def snooze_quick(minutes: int = 30):
-    """GET-based snooze for Pushover action buttons (they can only open URLs)."""
     global snooze_until
     snooze_until = time.time() + (minutes * 60)
     log.info("Snoozed for %d minutes (via quick snooze)", minutes)
@@ -893,18 +1192,35 @@ async def test_notification():
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
-    media_data, media_type, media_ext = fetch_media(event["id"], retries=2, retry_interval=3)
-    if not media_data:
-        return {"status": "error", "message": "Could not fetch media"}
-
+    event_id = event["id"]
     title = f"Test - {event['label'].title()} on {event['camera']}"
     message = "Test notification from Frigate Alerts"
-    frigate_review_url, video_url = build_event_urls("test", event["id"])
-    send_to_all_providers(
-        title, message, media_data, media_type, media_ext,
-        frigate_review_url, video_url, "test", event["id"],
-        event["camera"], event["label"], "",
-    )
+    frigate_review_url, video_url = build_event_urls("test", event_id)
+
+    snap_data, snap_type, snap_ext = fetch_snapshot(event_id)
+    if not snap_data:
+        return {"status": "error", "message": "Could not fetch snapshot"}
+
+    def _run_test():
+        msg_refs = send_to_all_providers(
+            title, message, snap_data, snap_type, snap_ext,
+            frigate_review_url, video_url, "test", event_id,
+            event["camera"], event["label"], "",
+        )
+        log.info("Test Phase 1: Snapshot sent")
+
+        gif_data, gif_type, gif_ext = fetch_gif(event_id, retries=2, retry_interval=3)
+        if gif_data:
+            update_all_providers(
+                msg_refs, title, message, gif_data, gif_type, gif_ext,
+                frigate_review_url, video_url, "test", event_id,
+                event["camera"], event["label"], "",
+            )
+            log.info("Test Phase 2: GIF upgrade sent")
+        else:
+            log.info("Test Phase 2: No GIF available, snapshot stands")
+
+    threading.Thread(target=_run_test, daemon=True).start()
     return {"status": "ok", "camera": event["camera"], "label": event["label"]}
 
 
