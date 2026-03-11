@@ -63,7 +63,8 @@ shutting_down = False
 
 # Thread-safe dedup
 _dedup_lock = threading.Lock()
-notified_reviews = set()
+notified_reviews = set()  # Reviews we actually sent notifications for
+seen_reviews = set()       # Reviews we've seen (sent OR filtered) - prevents repeat log spam
 
 # Phase 2 tracking: review_id -> {msg_refs, title, message, ...}
 _phase2_lock = threading.Lock()
@@ -660,39 +661,48 @@ def process_phase1(review):
     detections = review.get("data", {}).get("detections", [])
     zones = review.get("data", {}).get("zones", [])
 
-    # Thread-safe dedup
-    if not _add_to_dedup(review_id):
-        return
-
     stats["events_received"] += 1
 
     # Stale event filter (skip events older than 5 minutes)
     start_time = review.get("start_time", 0)
     if start_time and (time.time() - start_time) > 300:
         log.info("Skipping stale event %s (%.0fs old)", review_id, time.time() - start_time)
+        with _dedup_lock:
+            seen_reviews.add(review_id)
         stats["events_skipped"] += 1
         return
 
-    log.info("Phase 1: Review %s camera=%s objects=%s zones=%s", review_id, camera, objects, zones)
-
     if is_snoozed():
-        log.info("Skipping: snoozed until %s", datetime.fromtimestamp(snooze_until).strftime("%H:%M"))
+        log.info("Skipping %s: snoozed until %s", review_id, datetime.fromtimestamp(snooze_until).strftime("%H:%M"))
         stats["events_skipped"] += 1
         return
     if in_quiet_hours():
-        log.info("Skipping: quiet hours active")
+        log.info("Skipping %s: quiet hours active", review_id)
         stats["events_skipped"] += 1
         return
     if not should_notify(camera, objects, zones):
+        # Track as seen to prevent repeat log spam from poller
+        with _dedup_lock:
+            seen_reviews.add(review_id)
+            if len(seen_reviews) > 3000:
+                seen_reviews.clear()
         stats["events_skipped"] += 1
         return
     if check_cooldown(camera):
-        log.info("Skipping: camera %s in cooldown", camera)
+        log.info("Skipping %s: camera %s in cooldown", review_id, camera)
         stats["events_skipped"] += 1
         return
     if not detections:
         stats["events_skipped"] += 1
         return
+
+    # Thread-safe dedup — only after passing all filters
+    # This ensures filtered events (e.g., 'car' only) don't block
+    # later updates that add matching objects (e.g., 'car' + 'person')
+    if not _add_to_dedup(review_id):
+        return
+
+    log.info("Phase 1: Review %s camera=%s objects=%s zones=%s", review_id, camera, objects, zones)
 
     set_cooldown(camera)
 
@@ -841,8 +851,8 @@ def poll_frigate():
                     # Process ANY alert review, not just ended ones
                     if review.get("severity") == "alert":
                         review_id = review.get("id", "")
-                        # Quick check without lock for performance
-                        if review_id not in notified_reviews:
+                        # Quick check: skip if already sent or already seen and filtered
+                        if review_id not in notified_reviews and review_id not in seen_reviews:
                             threading.Thread(
                                 target=process_phase1, args=(review,), daemon=True
                             ).start()
@@ -905,13 +915,28 @@ def on_message(client, userdata, msg):
             # Phase 1: Instant notification on event creation
             threading.Thread(target=process_phase1, args=(review,), daemon=True).start()
 
+        elif msg_type == "update":
+            # Check if the update now contains objects that pass our filter
+            # (e.g., review started as 'car' only, later 'person' was added)
+            review_id = review.get("id", "")
+            with _dedup_lock:
+                already_sent = review_id in notified_reviews
+            if not already_sent:
+                camera = review.get("camera", "")
+                objects = review.get("data", {}).get("objects", [])
+                zones = review.get("data", {}).get("zones", [])
+                if should_notify(camera, objects, zones):
+                    # Remove from seen_reviews so process_phase1 won't skip it
+                    with _dedup_lock:
+                        seen_reviews.discard(review_id)
+                    log.info("Update promoted to Phase 1: %s camera=%s objects=%s (new objects matched filter)", review_id, camera, objects)
+                    threading.Thread(target=process_phase1, args=(review,), daemon=True).start()
+
         elif msg_type == "end":
             # Phase 2: GIF upgrade when event ends
             review_id = review.get("id", "")
             if review_id:
                 threading.Thread(target=process_phase2, args=(review_id,), daemon=True).start()
-
-        # "update" type is ignored (intermediate updates during detection)
 
     except json.JSONDecodeError:
         pass
