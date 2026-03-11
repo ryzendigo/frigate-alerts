@@ -1,5 +1,5 @@
 """
-Frigate Alerts - Main Application (v2.5 - Security & reliability hardened)
+Frigate Alerts - Main Application (v2.6 - Deep hardening & polish)
 Animated GIF notifications from Frigate NVR events.
 Supports: Pushover, Discord, Telegram, Ntfy, Gotify, Email, Webhook
 
@@ -84,6 +84,9 @@ stats = {"phase1_sent": 0, "phase2_sent": 0, "events_received": 0, "events_skipp
 # Snooze: timestamp when snooze expires (0 = not snoozed)
 snooze_until = 0
 
+# Uptime tracking
+_start_time = time.time()
+
 # SEPARATE worker pools to prevent deadlock:
 # event_pool: processes events (Phase 1 + Phase 2). Each event blocks waiting for providers.
 # provider_pool: dispatches to notification providers. Never blocks on event_pool.
@@ -92,6 +95,9 @@ provider_pool = ThreadPoolExecutor(max_workers=16, thread_name_prefix="provider"
 
 # Thread-local HTTP sessions (requests.Session is NOT thread-safe)
 _thread_local = threading.local()
+
+# MQTT watchdog: track last message time to detect silent disconnects
+_mqtt_last_message_time = 0
 
 # Poller error suppression
 _last_poll_error = ""
@@ -219,11 +225,27 @@ def _validate_config():
 def save_config(new_config):
     global config
     try:
-        with open(CONFIG_PATH, "w") as f:
+        # Backup existing config before overwriting
+        if os.path.exists(CONFIG_PATH):
+            backup_path = CONFIG_PATH + ".bak"
+            try:
+                import shutil
+                shutil.copy2(CONFIG_PATH, backup_path)
+            except Exception:
+                pass
+        # Atomic write: write to temp file then rename (POSIX atomic)
+        tmp_path = CONFIG_PATH + ".tmp"
+        with open(tmp_path, "w") as f:
             yaml.dump(new_config, f, default_flow_style=False, sort_keys=False)
+        os.replace(tmp_path, CONFIG_PATH)
         config = new_config
     except Exception as e:
         log.error("Failed to save config: %s (in-memory config NOT updated)", e)
+        # Clean up temp file on failure
+        try:
+            os.unlink(CONFIG_PATH + ".tmp")
+        except OSError:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -281,6 +303,12 @@ def init_db():
                 review_id TEXT PRIMARY KEY,
                 context_data TEXT,
                 created_at REAL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS recent_reviews (
+                review_id TEXT PRIMARY KEY,
+                notified_at REAL
             )
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_history_timestamp ON history(timestamp)")
@@ -452,6 +480,48 @@ def load_pending_phase2():
         log.error("Load pending Phase 2 error: %s", e)
 
 
+def save_recent_review(review_id):
+    """Persist a notified review ID so we don't re-notify after restart."""
+    try:
+        with get_db() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO recent_reviews (review_id, notified_at) VALUES (?, ?)",
+                (review_id, time.time()),
+            )
+            conn.commit()
+    except Exception:
+        pass  # Non-critical — in-memory dedup is primary
+
+
+def load_recent_reviews():
+    """Load recent review IDs from SQLite on startup to prevent post-restart duplicates."""
+    try:
+        with get_db() as conn:
+            rows = conn.execute(
+                "SELECT review_id FROM recent_reviews WHERE notified_at > ?",
+                (time.time() - 300,),  # Last 5 minutes (covers poll lookback)
+            ).fetchall()
+            count = 0
+            with _dedup_lock:
+                for row in rows:
+                    notified_reviews[row[0]] = time.time()
+                    count += 1
+            if count:
+                log.info("Loaded %d recent review IDs from database (cross-restart dedup)", count)
+    except Exception as e:
+        log.error("Load recent reviews error: %s", e)
+
+
+def cleanup_recent_reviews():
+    """Remove old entries from recent_reviews table."""
+    try:
+        with get_db() as conn:
+            conn.execute("DELETE FROM recent_reviews WHERE notified_at < ?", (time.time() - 600,))
+            conn.commit()
+    except Exception:
+        pass
+
+
 def cleanup_phase2_db():
     """Remove stale Phase 2 entries from SQLite."""
     try:
@@ -481,6 +551,13 @@ def run_cleanup_loop():
     while not shutting_down.is_set():
         cleanup_history()
         cleanup_phase2_db()
+        cleanup_recent_reviews()
+        # WAL checkpoint to prevent unbounded WAL growth
+        try:
+            with get_db() as conn:
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except Exception:
+            pass
         with _dedup_lock:
             if len(notified_reviews) > 2000:
                 for _ in range(1000):
@@ -603,9 +680,10 @@ def build_message(camera, label_str, zone_str, review_id, event_id):
     if msg_tpl:
         message = render_template(msg_tpl, variables)
     else:
-        message = f"{label_str.title()} detected on {camera}"
+        time_str = datetime.now().strftime("%H:%M")
+        message = f"{label_str.title()} detected on {camera} at {time_str}"
         if zone_str:
-            message += f" ({zone_str})"
+            message += f" in {zone_str}"
     return title, message
 
 
@@ -616,7 +694,7 @@ def build_message(camera, label_str, zone_str, review_id, event_id):
 # Max clip size to process (50MB) — prevents ffmpeg from consuming excessive memory
 MAX_CLIP_SIZE = 50 * 1024 * 1024
 
-def clip_to_gif(clip_data, max_duration=3, fps=6, width=240):
+def clip_to_gif(clip_data, max_duration=3, fps=8, width=320):
     if len(clip_data) > MAX_CLIP_SIZE:
         log.warning("Clip too large (%d bytes > %d), skipping GIF conversion", len(clip_data), MAX_CLIP_SIZE)
         return None
@@ -975,7 +1053,9 @@ def send_to_all_providers(title, message, media_data, media_type, media_ext,
     senders = [_send_pushover_all, _send_discord_all, _send_telegram, _send_ntfy, _send_gotify, _send_smtp, _send_webhook]
     send_futures = []
     for sender in senders:
-        send_futures.append(provider_pool.submit(sender))
+        f = _safe_submit(provider_pool, sender)
+        if f:
+            send_futures.append(f)
 
     try:
         for f in as_completed(send_futures, timeout=45):
@@ -1032,8 +1112,10 @@ def update_all_providers(msg_refs, title, message, media_data, media_type, media
             except Exception as e:
                 log.error("Pushover update error: %s", e)
 
-    futures.append(provider_pool.submit(_update_discord))
-    futures.append(provider_pool.submit(_update_pushover))
+    for fn in (_update_discord, _update_pushover):
+        f = _safe_submit(provider_pool, fn)
+        if f:
+            futures.append(f)
 
     try:
         for f in as_completed(futures, timeout=45):
@@ -1055,7 +1137,9 @@ def _add_to_dedup(review_id):
         if review_id in notified_reviews:
             return False
         notified_reviews[review_id] = time.time()
-        return True
+    # Persist for cross-restart dedup (non-blocking, fire-and-forget)
+    save_recent_review(review_id)
+    return True
 
 
 def process_phase1(review):
@@ -1094,6 +1178,7 @@ def process_phase1(review):
         return
 
     if not isinstance(detections, list) or not detections:
+        log.debug("Skipping %s: no detections array (camera=%s)", review_id, camera)
         _inc_stat("events_skipped")
         return
 
@@ -1413,6 +1498,8 @@ def _safe_submit(pool, fn, *args):
 
 
 def on_message(client, userdata, msg):
+    global _mqtt_last_message_time
+    _mqtt_last_message_time = time.time()
     try:
         payload = json.loads(msg.payload)
         msg_type = payload.get("type")
@@ -1491,6 +1578,36 @@ def stop_mqtt():
             pass
         mqtt_client = None
         mqtt_connected = False
+
+
+def mqtt_watchdog_loop():
+    """Watchdog: force MQTT reconnect if connected but no messages for 10 minutes.
+    Catches silent disconnects where the broker drops us but paho thinks it's connected."""
+    global _mqtt_last_message_time
+    WATCHDOG_TIMEOUT = 600  # 10 minutes
+
+    while not shutting_down.is_set():
+        for _ in range(60):
+            if shutting_down.is_set():
+                return
+            time.sleep(1)
+
+        if not mqtt_connected or not mqtt_client:
+            continue
+
+        if _mqtt_last_message_time == 0:
+            # Never received a message — set baseline so watchdog doesn't fire on idle systems
+            _mqtt_last_message_time = time.time()
+            continue
+
+        silence = time.time() - _mqtt_last_message_time
+        if silence > WATCHDOG_TIMEOUT:
+            log.warning("MQTT watchdog: no messages for %.0fs, forcing reconnect", silence)
+            try:
+                mqtt_client.reconnect()
+                _mqtt_last_message_time = time.time()  # Reset to avoid rapid reconnect loop
+            except Exception as e:
+                log.error("MQTT watchdog reconnect failed: %s", e)
 
 
 # ---------------------------------------------------------------------------
@@ -1577,8 +1694,22 @@ async def lifespan(app: FastAPI):
     init_db()
     cleanup_history()
 
-    # Restore Phase 2 contexts from SQLite (survives restarts)
+    # Restore state from SQLite (survives restarts)
+    load_recent_reviews()
     load_pending_phase2()
+
+    # Startup connectivity check (non-blocking, informational only)
+    frigate_url = config.get("frigate", {}).get("url", "http://frigate:5000")
+    try:
+        r = requests.get(f"{frigate_url}/api/stats", timeout=5)
+        if r.status_code == 200:
+            stats_data = r.json()
+            cam_count = len(stats_data.get("cameras", {}))
+            log.info("Startup: Frigate reachable at %s (%d cameras)", frigate_url, cam_count)
+        else:
+            log.warning("Startup: Frigate returned %d (may not be ready yet)", r.status_code)
+    except Exception as e:
+        log.warning("Startup: Frigate not reachable at %s (%s) — poller will retry", frigate_url, e)
 
     # Start MQTT (primary)
     mqtt_conf = config.get("mqtt", {})
@@ -1597,10 +1728,14 @@ async def lifespan(app: FastAPI):
     # Start pending event retry loop
     threading.Thread(target=pending_retry_loop, daemon=True).start()
 
+    # Start MQTT watchdog (detects silent disconnects)
+    if mqtt_conf.get("enabled") and mqtt_conf.get("server"):
+        threading.Thread(target=mqtt_watchdog_loop, daemon=True).start()
+
     # Start cleanup loop
     threading.Thread(target=run_cleanup_loop, daemon=True).start()
 
-    log.info("Frigate Alerts v2.5 started (MQTT=%s, poll=%ds, event_pool=%d, provider_pool=%d)",
+    log.info("Frigate Alerts v2.6 started (MQTT=%s, poll=%ds, event_pool=%d, provider_pool=%d)",
              "enabled" if mqtt_conf.get("enabled") and mqtt_conf.get("server") else "disabled",
              config.get("poll_interval", 5),
              event_pool._max_workers,
@@ -1656,7 +1791,14 @@ async def get_config():
 
 @app.post("/api/config")
 async def update_config(request: Request):
-    new_config = await request.json()
+    try:
+        new_config = await request.json()
+    except Exception:
+        return JSONResponse({"status": "error", "message": "Invalid JSON"}, status_code=400)
+    if not isinstance(new_config, dict):
+        return JSONResponse({"status": "error", "message": "Config must be a JSON object"}, status_code=400)
+    if not new_config.get("frigate", {}).get("url"):
+        return JSONResponse({"status": "error", "message": "frigate.url is required"}, status_code=400)
     save_config(new_config)
     stop_mqtt()
     mqtt_conf = new_config.get("mqtt", {})
@@ -1669,7 +1811,7 @@ async def update_config(request: Request):
 
 @app.get("/api/history")
 async def history(limit: int = 50):
-    return get_history(limit)
+    return get_history(min(limit, 500))
 
 
 @app.get("/api/status")
@@ -1703,6 +1845,7 @@ async def status():
         "snooze_remaining": max(0, int(snooze_until - time.time())) if is_snoozed() else 0,
         "quiet_hours_active": in_quiet_hours(),
         "pending_phase2": len(pending_phase2),
+        "uptime_seconds": int(time.time() - _start_time),
         "stats": stats_copy,
     }
 
@@ -1712,6 +1855,7 @@ async def snooze(request: Request):
     global snooze_until
     body = await request.json()
     minutes = body.get("minutes", 30)
+    minutes = min(minutes, 1440)  # Cap at 24 hours
     if minutes <= 0:
         snooze_until = 0
         return {"status": "ok", "snoozed": False}
@@ -1731,6 +1875,7 @@ async def snooze_cancel():
 @app.get("/api/snooze/quick")
 async def snooze_quick(minutes: int = 30):
     global snooze_until
+    minutes = max(1, min(minutes, 1440))  # Bounds: 1 min to 24 hours
     snooze_until = time.time() + (minutes * 60)
     log.info("Snoozed for %d minutes (via quick snooze)", minutes)
     return HTMLResponse(f"""<!DOCTYPE html><html><head><meta charset="UTF-8">
@@ -1807,9 +1952,19 @@ async def health():
         details["provider_pool"] = "unhealthy"
         healthy = False
 
+    try:
+        with get_db() as conn:
+            conn.execute("SELECT 1 FROM history LIMIT 1")
+        details["database"] = "ok"
+    except Exception:
+        details["database"] = "unhealthy"
+        healthy = False
+
     mqtt_conf = config.get("mqtt", {})
     if mqtt_conf.get("enabled") and mqtt_conf.get("server"):
         details["mqtt"] = "connected" if mqtt_connected else "disconnected"
+        if not mqtt_connected:
+            healthy = False
 
     details["poller"] = "running" if poller_running else "stopped"
 

@@ -7,18 +7,26 @@ from datetime import datetime, timezone
 
 log = logging.getLogger("frigate-alerts")
 
-# Embed color (blue accent matching the web UI)
-EMBED_COLOR = 0x3B82F6
+# Embed colors
+COLOR_ALERT = 0xEF4444    # Red — Phase 1 (new detection)
+COLOR_UPDATED = 0x22C55E  # Green — Phase 2 (GIF upgrade, event resolved)
+
+# Branded webhook identity
+WEBHOOK_USERNAME = "Frigate Alerts"
+WEBHOOK_AVATAR = "https://raw.githubusercontent.com/blakeblackshear/frigate/dev/docs/static/img/frigate.png"
 
 
-def _build_embed(title, message, camera, label, zone, url, video_url, ext):
+def _build_embed(title, message, camera, label, zone, url, video_url, ext, is_update=False):
     """Build a Discord rich embed dict."""
     embed = {
         "title": title,
         "description": message,
-        "color": EMBED_COLOR,
+        "color": COLOR_UPDATED if is_update else COLOR_ALERT,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "fields": [],
+        "footer": {
+            "text": "Frigate Alerts" + (" • Updated with clip" if is_update else ""),
+        },
     }
 
     if camera:
@@ -69,8 +77,12 @@ def send_discord(webhook_config, title, message, image_data, image_type="image/g
         return "error: no webhook URL", None
 
     ext = _get_ext(image_type)
-    embed = _build_embed(title, message, camera, label, zone, url, video_url, ext)
-    payload = {"embeds": [embed]}
+    embed = _build_embed(title, message, camera, label, zone, url, video_url, ext, is_update=False)
+    payload = {
+        "username": WEBHOOK_USERNAME,
+        "avatar_url": WEBHOOK_AVATAR,
+        "embeds": [embed],
+    }
 
     files = {
         "payload_json": (None, json.dumps(payload), "application/json"),
@@ -110,8 +122,13 @@ def update_discord(webhook_url, message_id, title, message, image_data, image_ty
         return "error: missing webhook URL or message ID"
 
     ext = _get_ext(image_type)
-    embed = _build_embed(title, message, camera, label, zone, url, video_url, ext)
-    payload = {"embeds": [embed], "attachments": []}
+    embed = _build_embed(title, message, camera, label, zone, url, video_url, ext, is_update=True)
+    payload = {
+        "username": WEBHOOK_USERNAME,
+        "avatar_url": WEBHOOK_AVATAR,
+        "embeds": [embed],
+        "attachments": [],
+    }
 
     files = {
         "payload_json": (None, json.dumps(payload), "application/json"),
