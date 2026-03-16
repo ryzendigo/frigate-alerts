@@ -78,8 +78,25 @@ pending_phase2 = {}
 _cooldown_lock = threading.Lock()
 camera_cooldowns = {}
 
+# Sound suppression: only the first notification in a burst window plays sound
+_sound_lock = threading.Lock()
+_last_sound_time = 0
+SOUND_BURST_WINDOW = 15  # seconds - subsequent notifications within this window are silent
+
 _stats_lock = threading.Lock()
 stats = {"phase1_sent": 0, "phase2_sent": 0, "events_received": 0, "events_skipped": 0, "errors": 0}
+
+def _should_play_sound():
+    """Returns True if this notification should play sound, False if it should be silent.
+    Only the first notification in a burst window gets sound."""
+    global _last_sound_time
+    with _sound_lock:
+        now = time.time()
+        if now - _last_sound_time > SOUND_BURST_WINDOW:
+            _last_sound_time = now
+            return True
+        return False
+
 
 # Snooze: timestamp when snooze expires (0 = not snoozed)
 snooze_until = 0
@@ -651,6 +668,33 @@ def filter_labels(objects):
     return [o for o in objects if o in allowed_labels]
 
 
+def fetch_sub_labels(event_ids):
+    """Query Frigate API for sub_labels (face recognition names) on detection events.
+    Returns a list of recognized names (deduplicated, title-cased)."""
+    if not event_ids or not _frigate_circuit_ok():
+        return []
+    frigate_url = config.get("frigate", {}).get("url", "http://frigate:5000")
+    names = []
+    session = _get_session()
+    for eid in event_ids[:5]:
+        try:
+            resp = session.get(f"{frigate_url}/api/events/{eid}", timeout=3)
+            if resp.status_code == 200:
+                event = resp.json()
+                sub = event.get("sub_label")
+                if sub and isinstance(sub, str) and sub.strip():
+                    name = sub.strip().title()
+                    if name not in names:
+                        names.append(name)
+                _frigate_success()
+            else:
+                _frigate_failure()
+        except Exception as e:
+            log.debug("Failed to fetch sub_label for event %s: %s", eid, e)
+            _frigate_failure()
+    return names
+
+
 # ---------------------------------------------------------------------------
 # Message template rendering
 # ---------------------------------------------------------------------------
@@ -662,11 +706,14 @@ def render_template(template, variables):
         return template
 
 
-def build_message(camera, label_str, zone_str, review_id, event_id):
+def build_message(camera, label_str, zone_str, review_id, event_id, face_names=None):
+    name_str = ", ".join(face_names) if face_names else ""
+    display_label = name_str if name_str else label_str.title()
     variables = {
         "camera": camera,
-        "label": label_str.title(),
+        "label": display_label,
         "labels": label_str,
+        "name": name_str,
         "zone": zone_str,
         "zones": zone_str,
         "time": datetime.now().strftime("%H:%M:%S"),
@@ -681,7 +728,10 @@ def build_message(camera, label_str, zone_str, review_id, event_id):
         message = render_template(msg_tpl, variables)
     else:
         time_str = datetime.now().strftime("%H:%M")
-        message = f"{label_str.title()} detected on {camera} at {time_str}"
+        if name_str:
+            message = f"{name_str} detected on {camera} at {time_str}"
+        else:
+            message = f"{label_str.title()} detected on {camera} at {time_str}"
         if zone_str:
             message += f" in {zone_str}"
     return title, message
@@ -917,7 +967,7 @@ def _retry_provider(func, provider_name, max_retries=2):
 
 def send_to_all_providers(title, message, media_data, media_type, media_ext,
                           frigate_url, video_url, review_id, event_id,
-                          camera, label_str, zone_str):
+                          camera, label_str, zone_str, silent=False):
     """Send notification to all enabled providers IN PARALLEL using provider_pool."""
     snooze_url = build_snooze_url(30)
     media_size = len(media_data) if media_data else 0
@@ -941,7 +991,7 @@ def send_to_all_providers(title, message, media_data, media_type, media_ext,
                     return send_pushover(
                         po, r, title, message, media_data, media_type,
                         url=frigate_url, video_url=video_url, snooze_url=snooze_url,
-                        camera_overrides=cam_overrides, session=nsess,
+                        camera_overrides=cam_overrides, silent=silent, session=nsess,
                     )
                 status = _retry_provider(_do_send, f"Pushover/{r.get('name', '?')}")
                 log_notification(review_id, event_id, camera, label_str, zone_str, "pushover", r.get("name", ""), status, gif_size=media_size)
@@ -1205,14 +1255,17 @@ def process_phase1(review):
             notified_reviews.pop(review_id, None)
         return
 
+    silent = not _should_play_sound()
+    if silent:
+        log.info("Phase 1: Suppressing sound for %s (burst window, camera=%s)", review_id, camera)
     t_start = time.time()
     msg_refs = send_to_all_providers(
         title, message, snap_data, snap_type, snap_ext,
         frigate_url, video_url, review_id, event_id,
-        camera, label_str, zone_str,
+        camera, label_str, zone_str, silent=silent,
     )
     elapsed = time.time() - t_start
-    log.info("Phase 1 SENT for %s in %.1fs (camera=%s)", review_id, elapsed, camera)
+    log.info("Phase 1 SENT for %s in %.1fs (camera=%s%s)", review_id, elapsed, camera, ", silent" if silent else "")
     _inc_stat("phase1_sent")
 
     remove_pending_event(review_id)
@@ -1237,6 +1290,8 @@ def process_phase1(review):
                 "label_str": label_str,
                 "zone_str": zone_str,
                 "created_at": time.time(),
+                "objects": objects,
+                "detections": detections,
             }
             pending_phase2[review_id] = ctx
         # Persist to SQLite so Phase 2 survives container restart
@@ -1259,6 +1314,19 @@ def process_phase2(review_id):
 
     gif_data, gif_type, gif_ext = fetch_gif(event_id)
     if gif_data:
+        # Phase 2: face recognition should be available now - re-check sub_labels
+        objects = ctx.get("objects", [])
+        detections = ctx.get("detections", [])
+        face_names = fetch_sub_labels(detections) if "person" in objects else []
+        if face_names:
+            log.info("Face recognition (Phase 2): %s identified in %s", face_names, ctx["camera"])
+            # Rebuild title and message with face names
+            title, message = build_message(
+                ctx["camera"], ctx["label_str"], ctx["zone_str"],
+                review_id, event_id, face_names=face_names,
+            )
+            ctx["title"] = title
+            ctx["message"] = message
         t_start = time.time()
         update_all_providers(
             ctx["msg_refs"], ctx["title"], ctx["message"],
