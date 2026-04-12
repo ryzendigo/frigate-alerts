@@ -1852,6 +1852,39 @@ def _mask_secrets(obj, _sensitive={"token", "password", "secret", "api_key", "ap
         return [_mask_secrets(i) for i in obj]
     return obj
 
+
+def _unmask_secrets(new_obj, orig_obj, _sensitive={"token", "password", "secret", "api_key", "apikey", "userkey", "webhook"}):
+    """Restore masked values (ending in ****) from the live config before saving.
+
+    When the web UI fetches config via GET /api/config, sensitive fields are
+    masked (e.g. "aqzg****").  If the user saves the config back without
+    editing those fields, the masked placeholders would overwrite the real
+    secrets on disk.  This function detects masked values and restores them
+    from the currently-loaded (unmasked) config.
+    """
+    if isinstance(new_obj, dict) and isinstance(orig_obj, dict):
+        restored = {}
+        for k, v in new_obj.items():
+            orig_v = orig_obj.get(k)
+            is_sensitive_key = any(s in k.lower() for s in _sensitive)
+            is_webhook_url = k == "url" and isinstance(v, str) and ("webhook" in v.lower() or "hooks" in v.lower() or v.endswith("****"))
+            if (is_sensitive_key or is_webhook_url) and isinstance(v, str) and v.endswith("****") and isinstance(orig_v, str):
+                restored[k] = orig_v
+            elif orig_v is not None:
+                restored[k] = _unmask_secrets(v, orig_v, _sensitive)
+            else:
+                restored[k] = v
+        return restored
+    elif isinstance(new_obj, list) and isinstance(orig_obj, list):
+        result = []
+        for i, item in enumerate(new_obj):
+            if i < len(orig_obj):
+                result.append(_unmask_secrets(item, orig_obj[i], _sensitive))
+            else:
+                result.append(item)
+        return result
+    return new_obj
+
 @app.get("/api/config")
 async def get_config():
     return _mask_secrets(json.loads(json.dumps(config)))
@@ -1867,6 +1900,7 @@ async def update_config(request: Request):
         return JSONResponse({"status": "error", "message": "Config must be a JSON object"}, status_code=400)
     if not new_config.get("frigate", {}).get("url"):
         return JSONResponse({"status": "error", "message": "frigate.url is required"}, status_code=400)
+    new_config = _unmask_secrets(new_config, config)
     save_config(new_config)
     stop_mqtt()
     mqtt_conf = new_config.get("mqtt", {})
