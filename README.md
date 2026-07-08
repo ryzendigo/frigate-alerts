@@ -224,6 +224,27 @@ Default message: `Person detected on front_door (driveway)`
 | `/api/health` | GET | Health check endpoint |
 | `/metrics` | GET | Prometheus metrics (counters and gauges) for Grafana/alerting |
 
+## Monitoring
+
+A Prometheus metrics endpoint is exposed at `/metrics`. Point Prometheus at it:
+
+```yaml
+scrape_configs:
+  - job_name: frigate-alerts
+    static_configs:
+      - targets: ['frigate-alerts:8085']
+```
+
+Metrics are prefixed `frigate_alerts_`. Counters (`*_total`) reset on restart, which `rate()` handles. Example queries:
+
+- Notifications per hour: `rate(frigate_alerts_phase1_sent_total[1h]) * 3600`
+- Error rate: `rate(frigate_alerts_errors_total[5m])`
+- Events filtered out per hour: `rate(frigate_alerts_events_skipped_total[1h]) * 3600`
+- MQTT connected: `frigate_alerts_mqtt_connected`
+- Backlog of pending GIF upgrades: `frigate_alerts_pending_phase2`
+
+Gauges also cover `poller_running`, `frigate_circuit_breaker_open`, `snoozed`, and `uptime_seconds`.
+
 ## Requirements
 
 - Frigate NVR (v0.14+)
