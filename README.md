@@ -253,6 +253,15 @@ A ready-to-import Grafana dashboard is included: [`grafana-dashboard.json`](graf
 - Docker
 - That's it. No MQTT broker required.
 
+## Development
+
+Core logic (secret masking/unmasking, camera/label/zone filtering, message
+templating) has regression tests that run on the standard library alone:
+
+```bash
+python tests/test_core.py
+```
+
 ## License
 
 MIT
