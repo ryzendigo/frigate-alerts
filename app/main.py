@@ -19,6 +19,7 @@ Architecture:
   - Connection-pooled HTTP sessions for notifier providers
 """
 
+import hashlib
 import html
 import json
 import logging
@@ -372,10 +373,19 @@ def get_history(limit=50):
 
 def save_pending_event(review_id, event_data, phase):
     try:
+        payload = json.dumps(event_data)
         with get_db() as conn:
+            # INSERT OR IGNORE (not REPLACE) so that re-saving a still-failing
+            # event preserves its attempts/created_at. Otherwise the retry cap
+            # (attempts < 5) and the age-based cleanup never fire and a
+            # permanently-unfetchable event retries forever.
             conn.execute(
-                "INSERT OR REPLACE INTO pending_events (review_id, event_data, phase, attempts, next_retry, created_at) VALUES (?, ?, ?, 0, ?, ?)",
-                (review_id, json.dumps(event_data), phase, time.time(), time.time()),
+                "INSERT OR IGNORE INTO pending_events (review_id, event_data, phase, attempts, next_retry, created_at) VALUES (?, ?, ?, 0, ?, ?)",
+                (review_id, payload, phase, time.time(), time.time()),
+            )
+            conn.execute(
+                "UPDATE pending_events SET event_data = ?, phase = ? WHERE review_id = ?",
+                (payload, phase, review_id),
             )
             conn.commit()
     except Exception as e:
@@ -1211,9 +1221,10 @@ def process_phase1(review):
     """Phase 1: Instant snapshot notification on event creation."""
     review_id = review.get("id", "")
     camera = review.get("camera", "")
-    objects = review.get("data", {}).get("objects", [])
-    detections = review.get("data", {}).get("detections", [])
-    zones = review.get("data", {}).get("zones", [])
+    data = review.get("data") or {}
+    objects = data.get("objects", [])
+    detections = data.get("detections", [])
+    zones = data.get("zones", [])
 
     _inc_stat("events_received")
 
@@ -1314,6 +1325,14 @@ def process_phase1(review):
             pending_phase2[review_id] = ctx
         # Persist to SQLite so Phase 2 survives container restart
         save_phase2_context(review_id, ctx)
+        # Guard the DELETE-before-INSERT race: if a fast "end" ran Phase 2 (which
+        # pops the ctx and DELETEs the row) between the in-memory add above and
+        # this write, drop the row we just wrote so a restart can't replay a
+        # duplicate GIF from an orphaned entry.
+        with _phase2_lock:
+            still_pending = review_id in pending_phase2
+        if not still_pending:
+            remove_phase2_context(review_id)
 
 
 def process_phase2(review_id):
@@ -1433,17 +1452,23 @@ def pending_retry_loop():
                 review_id = row["review_id"]
                 try:
                     event_data = json.loads(row["event_data"])
+                except json.JSONDecodeError:
+                    log.error("Pending event %s has corrupt JSON, removing", review_id)
+                    remove_pending_event(review_id)
+                    continue
+                try:
                     log.info("Retrying pending event %s (attempt %d)", review_id, row["attempts"] + 1)
                     with _dedup_lock:
                         notified_reviews.pop(review_id, None)
                         seen_reviews.pop(review_id, None)
                     process_phase1(event_data)
-                except json.JSONDecodeError:
-                    log.error("Pending event %s has corrupt JSON, removing", review_id)
-                    remove_pending_event(review_id)
                 except Exception as e:
                     log.error("Pending retry error for %s: %s", review_id, e)
-                    increment_pending_retry(review_id, row["attempts"])
+                # Advance attempts + backoff. No-op if process_phase1 succeeded and
+                # removed the row; if it failed again (missing snapshot does NOT
+                # raise, it re-queues), this ensures the event retires at attempts>=5
+                # instead of retrying on every poll forever.
+                increment_pending_retry(review_id, row["attempts"])
         except Exception as e:
             log.error("Pending retry loop error: %s", e)
         for _ in range(10):
@@ -1495,17 +1520,31 @@ def poll_frigate(generation):
                 _frigate_success()
 
                 for review in reviews:
-                    if review.get("severity") == "alert":
-                        review_id = review.get("id", "")
-                        with _dedup_lock:
-                            already_handled = review_id in notified_reviews or review_id in seen_reviews
-                        if not already_handled:
+                    if review.get("severity") != "alert":
+                        continue
+                    review_id = review.get("id", "")
+                    with _dedup_lock:
+                        already_sent = review_id in notified_reviews
+                        was_seen = review_id in seen_reviews
+                    if already_sent:
+                        pass  # already notified
+                    elif was_seen:
+                        # Promote a previously-filtered review that now qualifies
+                        # (e.g. car -> person). Mirrors the MQTT 'update' handler so
+                        # label promotions aren't missed when MQTT is down and the
+                        # poller is the only path.
+                        data = review.get("data") or {}
+                        if should_notify(review.get("camera", ""), data.get("objects", []), data.get("zones", [])):
+                            with _dedup_lock:
+                                seen_reviews.pop(review_id, None)
                             _safe_submit(event_pool, process_phase1, review)
-                        if review.get("end_time"):
-                            with _phase2_lock:
-                                has_pending = review_id in pending_phase2
-                            if has_pending:
-                                _safe_submit(event_pool, process_phase2, review_id)
+                    else:
+                        _safe_submit(event_pool, process_phase1, review)
+                    if review.get("end_time"):
+                        with _phase2_lock:
+                            has_pending = review_id in pending_phase2
+                        if has_pending:
+                            _safe_submit(event_pool, process_phase2, review_id)
             else:
                 _frigate_failure()
                 _handle_poll_error(f"HTTP {resp.status_code}")
@@ -1599,7 +1638,8 @@ def on_message(client, userdata, msg):
     try:
         payload = json.loads(msg.payload)
         msg_type = payload.get("type")
-        review = payload.get("after", {})
+        # `or {}` (not a get-default) because Frigate can send an explicit null
+        review = payload.get("after") or {}
         severity = review.get("severity", "")
 
         if severity != "alert":
@@ -1614,8 +1654,9 @@ def on_message(client, userdata, msg):
                 already_sent = review_id in notified_reviews
             if not already_sent:
                 camera = review.get("camera", "")
-                objects = review.get("data", {}).get("objects", [])
-                zones = review.get("data", {}).get("zones", [])
+                data = review.get("data") or {}
+                objects = data.get("objects", [])
+                zones = data.get("zones", [])
                 if should_notify(camera, objects, zones):
                     with _dedup_lock:
                         seen_reviews.pop(review_id, None)
@@ -1869,13 +1910,20 @@ _SENSITIVE_KEYS = {"token", "password", "secret", "api_key", "apikey", "userkey"
 
 def _mask_one(key, value, _sensitive=_SENSITIVE_KEYS):
     """Return the masked form of a single (key, value) pair, or None if the
-    value is not a sensitive string that should be masked."""
+    value is not a sensitive string that should be masked.
+
+    A short non-reversible hash is appended so that different secrets never
+    collapse to the same masked string. Without it, values sharing a prefix
+    (every Discord webhook URL shares the same first 30 chars) would mask
+    identically and get restored onto each other's entries on save."""
     if not isinstance(value, str):
         return None
+    tag = hashlib.sha256(value.encode()).hexdigest()[:6]
     if any(s in key.lower() for s in _sensitive) and len(value) > 4:
-        return value[:4] + "****"
+        return f"{value[:4]}****{tag}"
     if key == "url" and ("webhook" in value.lower() or "hooks" in value.lower()):
-        return value[:30] + "****" if len(value) > 30 else "****"
+        prefix = value[:30] if len(value) > 30 else ""
+        return f"{prefix}****{tag}"
     return None
 
 
@@ -1927,7 +1975,7 @@ def _unmask_secrets(new_obj, orig_obj, _sensitive=_SENSITIVE_KEYS):
             return {k: _restore(v) for k, v in o.items()}
         if isinstance(o, list):
             return [_restore(i) for i in o]
-        if isinstance(o, str) and o.endswith("****") and o in unmask_map:
+        if isinstance(o, str) and "****" in o and o in unmask_map:
             return unmask_map[o]
         return o
 
