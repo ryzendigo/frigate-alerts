@@ -77,7 +77,7 @@ def send_discord(webhook_config, title, message, image_data, image_type="image/g
     if not webhook_url:
         return "error: no webhook URL", None
 
-    ext = _get_ext(image_type)
+    ext = _get_ext(image_type) if image_data else ""  # no attachment ref for text-only sends
     embed = _build_embed(title, message, camera, label, zone, url, video_url, ext, is_update=False)
     payload = {
         "username": WEBHOOK_USERNAME,

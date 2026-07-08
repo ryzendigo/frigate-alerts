@@ -1330,12 +1330,13 @@ def process_phase1(review):
     # Optional LLM scene description (fail-open: any failure/timeout just sends
     # the normal message). Enriches both the Phase 1 alert and the stored ctx
     # so it carries through to the Phase 2 update. Adds up to llm.timeout latency.
+    llm_desc = None
     llm_cfg = config.get("llm", {})
     if llm_cfg.get("enabled"):
-        desc = describe_image(llm_cfg, snap_data, context=f"{label_str} detected on {camera}")
-        if desc:
-            message = f"{desc}\n\n{message}"
-            log.info("LLM scene description for %s: %s", review_id, desc)
+        llm_desc = describe_image(llm_cfg, snap_data, context=f"{label_str} detected on {camera}")
+        if llm_desc:
+            message = f"{llm_desc}\n\n{message}"
+            log.info("LLM scene description for %s: %s", review_id, llm_desc)
 
     # Check silent zones first so a quiet-zone alert does not consume the
     # burst-window sound slot that a later loud alert should get.
@@ -1385,6 +1386,7 @@ def process_phase1(review):
                 "created_at": time.time(),
                 "objects": objects,
                 "detections": detections,
+                "llm_desc": llm_desc,
             }
             pending_phase2[review_id] = ctx
         # Persist to SQLite so Phase 2 survives container restart
@@ -1426,6 +1428,9 @@ def process_phase2(review_id):
                 ctx["camera"], ctx["label_str"], ctx["zone_str"],
                 review_id, event_id, face_names=face_names,
             )
+            # Preserve the Phase 1 LLM description so it isn't lost on the face rebuild
+            if ctx.get("llm_desc"):
+                message = f"{ctx['llm_desc']}\n\n{message}"
             ctx["title"] = title
             ctx["message"] = message
         t_start = time.time()
@@ -1818,9 +1823,18 @@ def mqtt_watchdog_loop():
 def send_daily_summary():
     """Send a text-only digest of the last 24h of alerts to all providers."""
     cutoff = time.time() - 86400
+    midnight = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
     try:
         with get_db() as conn:
             conn.row_factory = sqlite3.Row
+            # Idempotency across restarts: skip if a summary already went out today
+            # (the send below logs review_id='summary' rows to history).
+            if conn.execute(
+                "SELECT 1 FROM history WHERE review_id = 'summary' AND timestamp >= ? LIMIT 1",
+                (midnight,),
+            ).fetchone():
+                log.info("Daily summary already sent today, skipping")
+                return
             rows = conn.execute(
                 "SELECT camera, review_id FROM history WHERE timestamp > ? AND status = 'sent' AND review_id != 'summary' GROUP BY review_id",
                 (cutoff,),
