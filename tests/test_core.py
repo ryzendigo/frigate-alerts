@@ -119,6 +119,44 @@ class FilterTests(unittest.TestCase):
         self.assertEqual(main.filter_labels(["person", "car"]), ["person", "car"])
 
 
+class SilentZonesAndSnapshotTests(unittest.TestCase):
+    def setUp(self):
+        self._saved = main.config
+        main.config = {}
+
+    def tearDown(self):
+        main.config = self._saved
+
+    def test_silent_zone_all_silent(self):
+        main.config = {"silent_zones": ["street", "sidewalk"]}
+        self.assertTrue(main.zones_are_silent(["street"]))
+        self.assertTrue(main.zones_are_silent(["street", "sidewalk"]))
+
+    def test_silent_zone_mixed_is_loud(self):
+        main.config = {"silent_zones": ["street"]}
+        self.assertFalse(main.zones_are_silent(["street", "driveway"]))
+
+    def test_silent_zone_none_configured(self):
+        main.config = {}
+        self.assertFalse(main.zones_are_silent(["street"]))
+
+    def test_silent_zone_empty_event_zones(self):
+        main.config = {"silent_zones": ["street"]}
+        self.assertFalse(main.zones_are_silent([]))
+
+    def test_snapshot_query_default_bbox(self):
+        main.config = {}
+        self.assertEqual(main._snapshot_query(), "?bbox=1")
+
+    def test_snapshot_query_all_options(self):
+        main.config = {"snapshot": {"bbox": True, "timestamp": True, "crop": True}}
+        self.assertEqual(main._snapshot_query(), "?bbox=1&timestamp=1&crop=1")
+
+    def test_snapshot_query_all_off(self):
+        main.config = {"snapshot": {"bbox": False}}
+        self.assertEqual(main._snapshot_query(), "")
+
+
 class TemplateAndMiscTests(unittest.TestCase):
     def setUp(self):
         self._saved = main.config

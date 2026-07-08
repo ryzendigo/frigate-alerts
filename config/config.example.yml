@@ -25,6 +25,12 @@ mqtt:
 # clip = video mp4 (falls back to GIF if unavailable)
 media_type: gif
 
+# Snapshot overlays drawn by Frigate onto the notification image
+snapshot:
+  bbox: true        # draw the detection bounding box (default on)
+  timestamp: false  # burn in a timestamp
+  crop: false       # crop to the detection region
+
 # Message templates (variables: {camera}, {label}, {zone}, {time}, {date})
 # Leave blank for defaults
 # title_template: "{label} - {camera}"
@@ -41,6 +47,11 @@ labels:
 zones:
   allow: []
   block: []
+
+# Zones delivered silently (still sent, just no sound/vibration). An alert is
+# silent only if ALL its zones are listed here - e.g. silent_zones: [street]
+# keeps street-only alerts quiet but a person in street+driveway alerts normally.
+silent_zones: []
 
 # Cooldown per camera in seconds (0 = disabled, 300 = 5 min recommended)
 cooldown: 0

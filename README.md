@@ -21,6 +21,8 @@ Frigate generates animated preview GIFs for every detection event, but existing 
 - Per-camera Pushover sound and priority overrides
 - Cooldown per camera to prevent notification spam
 - Zone allow/block filtering
+- Silent zones (deliver low-priority zones without sound)
+- Bounding-box overlays on snapshots (see exactly what triggered)
 - Quiet hours (suppress during sleep)
 - Notification history with timestamps and status
 - Auto-cleanup of old history records

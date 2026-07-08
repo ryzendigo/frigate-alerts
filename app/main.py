@@ -673,6 +673,18 @@ def check_zones(event_zones):
     return True
 
 
+def zones_are_silent(event_zones):
+    """True if this event should be delivered silently based on its zones.
+
+    Silent only when EVERY matched zone is configured silent, so a detection that
+    is also in a non-silent zone still alerts normally (e.g. silent_zones=[street]
+    means street-only is quiet, but street+driveway alerts with sound)."""
+    silent_zones = config.get("silent_zones", [])
+    if not silent_zones or not event_zones:
+        return False
+    return all(z in silent_zones for z in event_zones)
+
+
 def should_notify(camera, labels, zones):
     allowed_cameras = config.get("cameras", [])
     if allowed_cameras and camera not in allowed_cameras:
@@ -827,15 +839,30 @@ def clip_to_gif(clip_data, max_duration=3, fps=8, width=320):
     return None
 
 
+def _snapshot_query():
+    """Frigate snapshot overlay params. bbox draws the detection box on the image
+    (default on); timestamp/crop are optional. Config: snapshot: {bbox, timestamp, crop}."""
+    snap = config.get("snapshot", {})
+    parts = []
+    if snap.get("bbox", True):
+        parts.append("bbox=1")
+    if snap.get("timestamp", False):
+        parts.append("timestamp=1")
+    if snap.get("crop", False):
+        parts.append("crop=1")
+    return ("?" + "&".join(parts)) if parts else ""
+
+
 def fetch_snapshot(event_id):
     if not _frigate_circuit_ok():
         return None, None, None
 
     frigate_url = config.get("frigate", {}).get("url", "http://frigate:5000")
     session = _get_session()
+    snap_query = _snapshot_query()
     for attempt in range(3):
         try:
-            resp = session.get(f"{frigate_url}/api/events/{event_id}/snapshot.jpg", timeout=5)
+            resp = session.get(f"{frigate_url}/api/events/{event_id}/snapshot.jpg{snap_query}", timeout=5)
             if resp.status_code == 200 and len(resp.content) > 100:
                 _frigate_success()
                 log.info("Fetched snapshot for %s (%d bytes)", event_id, len(resp.content))
@@ -1288,9 +1315,16 @@ def process_phase1(review):
     # own pending-event retry for the full cooldown window.
     set_cooldown(camera)
 
-    silent = not _should_play_sound()
+    # Check silent zones first so a quiet-zone alert does not consume the
+    # burst-window sound slot that a later loud alert should get.
+    if zones_are_silent(zones):
+        silent = True
+        silent_reason = "silent zone"
+    else:
+        silent = not _should_play_sound()
+        silent_reason = "burst window"
     if silent:
-        log.info("Phase 1: Suppressing sound for %s (burst window, camera=%s)", review_id, camera)
+        log.info("Phase 1: Suppressing sound for %s (%s, camera=%s)", review_id, silent_reason, camera)
     t_start = time.time()
     msg_refs = send_to_all_providers(
         title, message, snap_data, snap_type, snap_ext,
