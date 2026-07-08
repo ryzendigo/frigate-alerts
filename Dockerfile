@@ -4,7 +4,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg tzdata &
 
 WORKDIR /app
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# upgrade pip first to pull in build-time security fixes, then install pinned deps
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
 
 COPY app/ ./app/
 
