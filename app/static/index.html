@@ -257,6 +257,7 @@ td{padding:7px;border-bottom:1px solid var(--bd)}
 
 <script>
 const $=id=>document.getElementById(id);
+const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 let cam=[],lbl=[],za=[],zb=[],poRec=[],poOvr=[],dcWh=[];
 
 const chipCfg={
@@ -276,7 +277,7 @@ if(t.dataset.t==='hist')lH();
 function toast(m,ok=true){const e=document.createElement('div');e.className='toast '+(ok?'tok':'ter');e.textContent=m;document.body.appendChild(e);setTimeout(()=>e.remove(),3000)}
 
 function rChips(t){const c=chipCfg[t];const arr=c.arr();
-$(c.el).innerHTML=arr.map((v,i)=>`<span class="ch">${v}<span class="x" onclick="rmChip('${t}',${i})">&times;</span></span>`).join('')}
+$(c.el).innerHTML=arr.map((v,i)=>`<span class="ch">${esc(v)}<span class="x" onclick="rmChip('${t}',${i})">&times;</span></span>`).join('')}
 
 function rmChip(t,i){const c=chipCfg[t];const arr=c.arr();arr.splice(i,1);c.set(arr);rChips(t)}
 
@@ -284,20 +285,20 @@ function aChip(t){const c=chipCfg[t];const inp=$(c.inp);const v=inp.value.trim()
 c.arr().push(v);rChips(t);inp.value=''}
 
 function rR(){$('poR').innerHTML=poRec.map((r,i)=>
-`<div class="ri"><span class="n">${r.name}</span><span class="k">${r.userkey}</span><button class="btn bsm bd" onclick="poRec.splice(${i},1);rR()">&times;</button></div>`).join('')}
+`<div class="ri"><span class="n">${esc(r.name)}</span><span class="k">${esc(r.userkey)}</span><button class="btn bsm bd" onclick="poRec.splice(${i},1);rR()">&times;</button></div>`).join('')}
 
 function aR(){const n=$('poN').value.trim(),k=$('poK').value.trim();if(!n||!k)return;
 poRec.push({name:n,userkey:k});rR();$('poN').value='';$('poK').value=''}
 
 function rOvr(){$('poOvr').innerHTML=poOvr.map((o,i)=>
-`<div class="ri"><span class="n">${o.camera}</span><span class="k">sound: ${o.sound||'default'}, priority: ${o.priority||'default'}</span><button class="btn bsm bd" onclick="poOvr.splice(${i},1);rOvr()">&times;</button></div>`).join('')}
+`<div class="ri"><span class="n">${esc(o.camera)}</span><span class="k">sound: ${esc(o.sound||'default')}, priority: ${esc(o.priority||'default')}</span><button class="btn bsm bd" onclick="poOvr.splice(${i},1);rOvr()">&times;</button></div>`).join('')}
 
 function aOvr(){const c=$('poOC').value.trim(),s=$('poOS').value.trim(),p=$('poOP').value;if(!c)return;
 const o={camera:c};if(s)o.sound=s;if(p!=='')o.priority=+p;
 poOvr.push(o);rOvr();$('poOC').value='';$('poOS').value='';$('poOP').value=''}
 
 function rW(){$('dcW').innerHTML=dcWh.map((w,i)=>
-`<div class="ri"><span class="n">${w.name}</span><span class="k">${w.url.substring(0,45)}...</span><button class="btn bsm bd" onclick="dcWh.splice(${i},1);rW()">&times;</button></div>`).join('')}
+`<div class="ri"><span class="n">${esc(w.name)}</span><span class="k">${esc(w.url.substring(0,45))}...</span><button class="btn bsm bd" onclick="dcWh.splice(${i},1);rW()">&times;</button></div>`).join('')}
 
 function aW(){const n=$('dcN').value.trim(),u=$('dcU').value.trim();if(!n||!u)return;
 dcWh.push({name:n,url:u});rW();$('dcN').value='';$('dcU').value=''}
@@ -367,7 +368,7 @@ async function unsnooze(){try{await fetch('/api/snooze/cancel',{method:'POST'});
 async function lH(){try{const r=await fetch('/api/history?limit=50');const rows=await r.json();
 if(!rows.length){$('hB').innerHTML='<tr><td colspan="7" class="emp">No notifications yet</td></tr>';return}
 $('hB').innerHTML=rows.map(r=>{const t=new Date(r.timestamp*1000).toLocaleString();
-return`<tr><td>${t}</td><td>${r.camera}</td><td>${r.label}</td><td>${r.zones||''}</td><td>${r.provider}</td><td>${r.recipient}</td><td><span class="bg ${r.status==='sent'?'bg-s':'bg-e'}">${r.status}</span></td></tr>`}).join('')}catch(e){}}
+return`<tr><td>${esc(t)}</td><td>${esc(r.camera)}</td><td>${esc(r.label)}</td><td>${esc(r.zones||'')}</td><td>${esc(r.provider)}</td><td>${esc(r.recipient)}</td><td><span class="bg ${r.status==='sent'?'bg-s':'bg-e'}">${esc(r.status)}</span></td></tr>`}).join('')}catch(e){}}
 
 async function cS(){try{const r=await fetch('/api/status');const s=await r.json();
 $('fd').className='dot '+(s.frigate_connected?'g':'r');$('fs').textContent=s.frigate_connected?'Connected':'Disconnected';
