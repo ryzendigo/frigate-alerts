@@ -17,6 +17,10 @@ mqtt:
   topic_prefix: frigate
   client_id: frigate-alerts
 
+# How often (seconds) the API poller checks Frigate for new alerts.
+# Used when MQTT is disabled, and as a fallback safety net when it is enabled.
+# poll_interval: 5
+
 # Media type to attach: gif, snapshot, or clip
 # clip = video mp4 (falls back to GIF if unavailable)
 media_type: gif
@@ -51,7 +55,7 @@ quiet_hours:
 history_retention_days: 30
 
 # Seconds to wait before fetching GIF (Frigate needs time to generate it)
-gif_delay: 10
+gif_delay: 3
 gif_retries: 3
 gif_retry_interval: 5
 
