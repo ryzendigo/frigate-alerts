@@ -19,7 +19,10 @@ def send_ntfy(config, title, message, image_data, image_type="image/gif", url=No
     # Title/Message go in HTTP headers (body holds the binary image), so newlines
     # must be stripped or they would corrupt the request / allow header injection.
     def _hdr(v):
-        return str(v).replace("\r", " ").replace("\n", " ").strip()
+        s = str(v).replace("\r", " ").replace("\n", " ").strip()
+        # HTTP headers are encoded latin-1; a char outside it (emoji, many
+        # non-Latin scripts) would raise UnicodeEncodeError and drop the alert.
+        return s.encode("latin-1", "replace").decode("latin-1")
 
     headers = {
         "Title": _hdr(title),

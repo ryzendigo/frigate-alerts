@@ -13,17 +13,22 @@ def send_pushover(config, recipient, title, message, image_data, image_type="ima
                    session=None):
     camera_overrides = camera_overrides or {}
 
+    try:
+        priority = int(camera_overrides.get("priority", config.get("priority", 0)))
+    except (TypeError, ValueError):
+        priority = 0
+    priority = max(-2, min(priority, 2))
+
     data = {
         "token": config["token"],
         "user": recipient["userkey"],
-        "title": title,
+        "title": (title or "")[:250],  # Pushover title limit
         "message": message,
         "sound": "none" if silent else camera_overrides.get("sound", config.get("sound", "pushover")),
-        "priority": str(camera_overrides.get("priority", config.get("priority", 0))),
+        "priority": str(priority),
         "html": "1",
     }
 
-    priority = int(data["priority"])
     if priority == 2:
         data["retry"] = str(config.get("retry", 60))
         data["expire"] = str(config.get("expire", 3600))
@@ -40,6 +45,8 @@ def send_pushover(config, recipient, title, message, image_data, image_type="ima
     # Snooze action link (skip on silent follow-ups to reduce clutter)
     if snooze_url and not silent:
         data["message"] += f'\n<a href="{snooze_url}">Snooze 30 min</a>'
+
+    data["message"] = data["message"][:1024]  # Pushover message limit
 
     # Attach image (GIF or snapshot - Pushover doesn't support video)
     files = None

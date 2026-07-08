@@ -24,6 +24,7 @@ import html
 import json
 import logging
 import os
+import secrets
 import sqlite3
 import subprocess
 import tempfile
@@ -925,7 +926,10 @@ def build_event_urls(review_id, event_id):
 def build_snooze_url(minutes):
     alerts_public = config.get("alerts_public_url", "")
     if alerts_public:
-        return f"{alerts_public}/api/snooze/quick?minutes={minutes}"
+        # include the anti-CSRF token so the snooze link can't be forged (e.g. an
+        # <img src> on a random page silently snoozing the whole alert system)
+        token = config.get("snooze_token", "")
+        return f"{alerts_public}/api/snooze/quick?minutes={minutes}&token={token}"
     return ""
 
 
@@ -1828,6 +1832,11 @@ def build_event_page(event_id):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     load_config()
+    # Ensure a stable anti-CSRF token exists for the quick-snooze link
+    if not config.get("snooze_token"):
+        config["snooze_token"] = secrets.token_urlsafe(16)
+        save_config(config)
+        log.info("Generated snooze_token for CSRF-safe quick-snooze links")
     init_db()
     cleanup_history()
 
@@ -2009,7 +2018,8 @@ async def update_config(request: Request):
 
 @app.get("/api/history")
 async def history(limit: int = 50):
-    return get_history(min(limit, 500))
+    # clamp low end too: SQLite treats LIMIT -1 as unlimited (whole-table dump)
+    return get_history(max(1, min(limit, 500)))
 
 
 @app.get("/api/status")
@@ -2079,8 +2089,13 @@ async def snooze_cancel():
 
 
 @app.get("/api/snooze/quick")
-async def snooze_quick(minutes: int = 30):
+async def snooze_quick(minutes: int = 30, token: str = ""):
     global snooze_until
+    # This is a state-changing GET (tapped from a notification link), so it must
+    # carry the anti-CSRF token or a forged <img src>/prefetch could snooze alerts.
+    expected = config.get("snooze_token", "")
+    if not expected or token != expected:
+        return HTMLResponse("<h1>Invalid or missing snooze token</h1>", status_code=403)
     minutes = max(1, min(minutes, 1440))  # Bounds: 1 min to 24 hours
     snooze_until = time.time() + (minutes * 60)
     log.info("Snoozed for %d minutes (via quick snooze)", minutes)
@@ -2104,8 +2119,12 @@ async def test_notification():
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
-    event_id = event["id"]
-    title = f"Test - {event['label'].title()} on {event['camera']}"
+    event_id = event.get("id")
+    if not event_id:
+        return {"status": "error", "message": "Frigate event missing id"}
+    label = str(event.get("label") or "object")
+    camera = str(event.get("camera") or "camera")
+    title = f"Test - {label.title()} on {camera}"
     message = "Test notification from Frigate Alerts"
     frigate_review_url, video_url = build_event_urls("test", event_id)
 
@@ -2117,7 +2136,7 @@ async def test_notification():
         msg_refs = send_to_all_providers(
             title, message, snap_data, snap_type, snap_ext,
             frigate_review_url, video_url, "test", event_id,
-            event["camera"], event["label"], "",
+            camera, label, "",
         )
         log.info("Test Phase 1: Snapshot sent")
 
@@ -2126,14 +2145,14 @@ async def test_notification():
             update_all_providers(
                 msg_refs, title, message, gif_data, gif_type, gif_ext,
                 frigate_review_url, video_url, "test", event_id,
-                event["camera"], event["label"], "",
+                camera, label, "",
             )
             log.info("Test Phase 2: GIF upgrade sent")
         else:
             log.info("Test Phase 2: No GIF available, snapshot stands")
 
     _safe_submit(event_pool, _run_test)
-    return {"status": "ok", "camera": event["camera"], "label": event["label"]}
+    return {"status": "ok", "camera": camera, "label": label}
 
 
 @app.get("/api/health")

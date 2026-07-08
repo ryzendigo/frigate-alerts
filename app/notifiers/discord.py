@@ -19,8 +19,8 @@ WEBHOOK_AVATAR = "https://raw.githubusercontent.com/blakeblackshear/frigate/dev/
 def _build_embed(title, message, camera, label, zone, url, video_url, ext, is_update=False):
     """Build a Discord rich embed dict."""
     embed = {
-        "title": title,
-        "description": message,
+        "title": (title or "")[:256],  # Discord embed title limit
+        "description": message or "",
         "color": COLOR_UPDATED if is_update else COLOR_ALERT,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "fields": [],
@@ -43,6 +43,7 @@ def _build_embed(title, message, camera, label, zone, url, video_url, ext, is_up
         links.append(f"[Watch Video]({video_url})")
     if links:
         embed["description"] += "\n\n" + " | ".join(links)
+    embed["description"] = embed["description"][:4096]  # Discord embed description limit
 
     if ext in ("gif", "jpg"):
         embed["image"] = {"url": f"attachment://preview.{ext}"}

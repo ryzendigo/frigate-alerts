@@ -14,8 +14,10 @@ def send_telegram(config, title, message, media_data, media_type="image/gif",
     if not token or not chat_id:
         return "error: missing token or chat_id"
 
-    # HTML parse mode with escaping - Markdown breaks on _ * [ ] in camera/label names
-    text = f"<b>{html.escape(title or '')}</b>\n{html.escape(message or '')}"
+    # HTML parse mode with escaping - Markdown breaks on _ * [ ] in camera/label names.
+    # Truncate the raw text (before escaping/tags) so the caption stays under
+    # Telegram's 1024-char limit without cutting an entity or tag mid-way.
+    text = f"<b>{html.escape((title or '')[:200])}</b>\n{html.escape((message or '')[:800])}"
     links = []
     if url:
         links.append(f'<a href="{html.escape(url)}">View in Frigate</a>')
