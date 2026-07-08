@@ -1902,12 +1902,12 @@ app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), na
 
 
 @app.get("/", response_class=HTMLResponse)
-async def index():
+def index():
     return HTMLResponse((Path(__file__).parent / "static" / "index.html").read_text())
 
 
 @app.get("/event/{event_id}", response_class=HTMLResponse)
-async def event_page(event_id: str):
+def event_page(event_id: str):
     html = build_event_page(event_id)
     if html:
         return HTMLResponse(html)
@@ -2017,13 +2017,13 @@ async def update_config(request: Request):
 
 
 @app.get("/api/history")
-async def history(limit: int = 50):
+def history(limit: int = 50):
     # clamp low end too: SQLite treats LIMIT -1 as unlimited (whole-table dump)
     return get_history(max(1, min(limit, 500)))
 
 
 @app.get("/api/status")
-async def status():
+def status():
     frigate_url = config.get("frigate", {}).get("url", "http://frigate:5000")
     frigate_ok = False
     session = _get_session()
@@ -2105,7 +2105,7 @@ async def snooze_quick(minutes: int = 30, token: str = ""):
 
 
 @app.post("/api/test")
-async def test_notification():
+def test_notification():
     frigate_url = config.get("frigate", {}).get("url", "http://frigate:5000")
     session = _get_session()
     try:
@@ -2156,7 +2156,7 @@ async def test_notification():
 
 
 @app.get("/api/health")
-async def health():
+def health():
     """Health check - verifies core subsystems are alive."""
     healthy = True
     details = {}
