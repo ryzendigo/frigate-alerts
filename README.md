@@ -245,6 +245,8 @@ Metrics are prefixed `frigate_alerts_`. Counters (`*_total`) reset on restart, w
 
 Gauges also cover `poller_running`, `frigate_circuit_breaker_open`, `snoozed`, and `uptime_seconds`.
 
+A ready-to-import Grafana dashboard is included: [`grafana-dashboard.json`](grafana-dashboard.json). In Grafana go to **Dashboards > Import > Upload JSON file**, then pick your Prometheus data source.
+
 ## Requirements
 
 - Frigate NVR (v0.14+)
