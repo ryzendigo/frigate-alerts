@@ -23,6 +23,7 @@ Frigate generates animated preview GIFs for every detection event, but existing 
 - Zone allow/block filtering
 - Silent zones (deliver low-priority zones without sound)
 - Bounding-box overlays on snapshots (see exactly what triggered)
+- Optional AI scene descriptions (OpenAI-compatible vision endpoint: Ollama, LocalAI, OpenAI, ...)
 - Quiet hours (suppress during sleep)
 - Notification history with timestamps and status
 - Optional daily summary digest (24h alert count per camera)

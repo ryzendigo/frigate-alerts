@@ -50,6 +50,7 @@ from .notifiers.ntfy import send_ntfy
 from .notifiers.gotify import send_gotify
 from .notifiers.smtp import send_smtp
 from .notifiers.webhook import send_webhook
+from .llm import describe_image
 
 logging.basicConfig(
     level=logging.INFO,
@@ -1325,6 +1326,16 @@ def process_phase1(review):
     # snapshot-fetch failure would set the camera cooldown and then block its
     # own pending-event retry for the full cooldown window.
     set_cooldown(camera)
+
+    # Optional LLM scene description (fail-open: any failure/timeout just sends
+    # the normal message). Enriches both the Phase 1 alert and the stored ctx
+    # so it carries through to the Phase 2 update. Adds up to llm.timeout latency.
+    llm_cfg = config.get("llm", {})
+    if llm_cfg.get("enabled"):
+        desc = describe_image(llm_cfg, snap_data, context=f"{label_str} detected on {camera}")
+        if desc:
+            message = f"{desc}\n\n{message}"
+            log.info("LLM scene description for %s: %s", review_id, desc)
 
     # Check silent zones first so a quiet-zone alert does not consume the
     # burst-window sound slot that a later loud alert should get.

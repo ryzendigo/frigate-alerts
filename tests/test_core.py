@@ -200,5 +200,47 @@ class TemplateAndMiscTests(unittest.TestCase):
         self.assertEqual(main._prom_escape("line1\nline2"), "line1\\nline2")
 
 
+class LLMTests(unittest.TestCase):
+    def test_returns_none_without_required_config(self):
+        from app.llm import describe_image
+        self.assertIsNone(describe_image({}, b"img"))
+        self.assertIsNone(describe_image({"base_url": "x"}, b"img"))   # no model
+        self.assertIsNone(describe_image({"base_url": "x", "model": "m"}, b""))  # no image
+
+    def test_success_parses_description_and_builds_request(self):
+        from app.llm import describe_image
+
+        class MockResp:
+            status_code = 200
+            text = ""
+            def json(self):
+                return {"choices": [{"message": {"content": "A person is walking a dog."}}]}
+
+        class MockSess:
+            def post(self, url, **kw):
+                self.url, self.kw = url, kw
+                return MockResp()
+
+        s = MockSess()
+        out = describe_image({"base_url": "http://x/v1", "model": "llava", "api_key": "k"},
+                             b"imgbytes", context="person on front", session=s)
+        self.assertEqual(out, "A person is walking a dog.")
+        self.assertTrue(s.url.endswith("/chat/completions"))
+        body = s.kw["json"]
+        self.assertEqual(body["model"], "llava")
+        self.assertEqual(body["messages"][0]["content"][1]["type"], "image_url")
+        self.assertEqual(s.kw["headers"]["Authorization"], "Bearer k")
+
+    def test_fail_open_on_exception(self):
+        from app.llm import describe_image
+
+        class MockSess:
+            def post(self, url, **kw):
+                raise RuntimeError("boom")
+
+        self.assertIsNone(describe_image({"base_url": "http://x/v1", "model": "m"},
+                                         b"img", session=MockSess()))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

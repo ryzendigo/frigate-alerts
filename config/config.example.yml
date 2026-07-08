@@ -31,6 +31,18 @@ snapshot:
   timestamp: false  # burn in a timestamp
   crop: false       # crop to the detection region
 
+# Optional AI scene description - sends the snapshot to an OpenAI-compatible
+# vision endpoint and prepends a one-line description to the notification.
+# Works with Ollama, LocalAI, vLLM, OpenAI, etc. Fail-open (never blocks an
+# alert). Adds up to `timeout` seconds of latency when enabled.
+llm:
+  enabled: false
+  base_url: http://ollama:11434/v1   # OpenAI-compatible base URL (note the /v1)
+  model: llava                        # a vision-capable model
+  api_key: ""                         # required for hosted APIs, blank for local
+  timeout: 10
+  # prompt: "In one short sentence, describe what is happening."
+
 # Message templates (variables: {camera}, {label}, {zone}, {time}, {date})
 # Leave blank for defaults
 # title_template: "{label} - {camera}"
