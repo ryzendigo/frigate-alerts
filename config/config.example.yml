@@ -65,6 +65,12 @@ quiet_hours:
 # How many days to keep notification history (auto-cleaned)
 history_retention_days: 30
 
+# Daily summary digest - a once-a-day text notification with the 24h alert count
+# per camera (sent silently). time is local HH:MM.
+daily_summary:
+  enabled: false
+  time: "09:00"
+
 # Seconds to wait before fetching GIF (Frigate needs time to generate it)
 gif_delay: 3
 gif_retries: 3

@@ -29,7 +29,13 @@ def send_telegram(config, title, message, media_data, media_type="image/gif",
     api_base = f"https://api.telegram.org/bot{token}"
 
     try:
-        if "video" in (media_type or ""):
+        if not media_data:
+            resp = requests.post(
+                f"{api_base}/sendMessage",
+                data={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
+                timeout=15,
+            )
+        elif "video" in (media_type or ""):
             resp = requests.post(
                 f"{api_base}/sendVideo",
                 data={"chat_id": chat_id, "caption": text, "parse_mode": "HTML"},

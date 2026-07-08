@@ -193,6 +193,12 @@ class TemplateAndMiscTests(unittest.TestCase):
         main.config = {"quiet_hours": {"enabled": False}}
         self.assertFalse(main.in_quiet_hours())
 
+    def test_prom_escape(self):
+        self.assertEqual(main._prom_escape("front"), "front")
+        self.assertEqual(main._prom_escape('bad"name'), 'bad\\"name')
+        self.assertEqual(main._prom_escape("a\\b"), "a\\\\b")
+        self.assertEqual(main._prom_escape("line1\nline2"), "line1\\nline2")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

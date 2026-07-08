@@ -31,11 +31,11 @@ def send_smtp(config, title, message, image_data, image_type="image/gif", url=No
     msg["To"] = ", ".join(recipients)
     msg.attach(MIMEText(body, _charset="utf-8"))
 
-    ext = "gif" if "gif" in image_type else "jpeg"
-    subtype = ext
-    img = MIMEImage(image_data, _subtype=subtype)
-    img.add_header("Content-Disposition", "attachment", filename=f"preview.{ext}")
-    msg.attach(img)
+    if image_data:
+        ext = "gif" if "gif" in image_type else "jpeg"
+        img = MIMEImage(image_data, _subtype=ext)
+        img.add_header("Content-Disposition", "attachment", filename=f"preview.{ext}")
+        msg.attach(img)
 
     try:
         with smtplib.SMTP(server, port, timeout=30) as smtp:

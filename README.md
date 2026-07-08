@@ -25,6 +25,8 @@ Frigate generates animated preview GIFs for every detection event, but existing 
 - Bounding-box overlays on snapshots (see exactly what triggered)
 - Quiet hours (suppress during sleep)
 - Notification history with timestamps and status
+- Optional daily summary digest (24h alert count per camera)
+- Prometheus metrics broken down per camera and per label
 - Auto-cleanup of old history records
 - Docker healthcheck endpoint
 - Single Docker container, minimal resource usage

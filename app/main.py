@@ -102,6 +102,12 @@ SOUND_BURST_WINDOW = 15  # seconds - subsequent notifications within this window
 
 _stats_lock = threading.Lock()
 stats = {"phase1_sent": 0, "phase2_sent": 0, "events_received": 0, "events_skipped": 0, "errors": 0}
+# Per-camera / per-label notification counts for labelled Prometheus metrics
+notif_by_camera = {}
+notif_by_label = {}
+
+# Daily summary: date string of the last digest sent (prevents duplicate sends)
+_last_summary_date = None
 
 def _should_play_sound():
     """Returns True if this notification should play sound, False if it should be silent.
@@ -203,6 +209,11 @@ def _frigate_failure():
 def _inc_stat(key, value=1):
     with _stats_lock:
         stats[key] = stats.get(key, 0) + value
+
+
+def _prom_escape(v):
+    """Escape a Prometheus label value (backslash, double-quote, newline)."""
+    return str(v).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
 
 
 def _add_to_seen(review_id):
@@ -1334,6 +1345,10 @@ def process_phase1(review):
     elapsed = time.time() - t_start
     log.info("Phase 1 SENT for %s in %.1fs (camera=%s%s)", review_id, elapsed, camera, ", silent" if silent else "")
     _inc_stat("phase1_sent")
+    with _stats_lock:
+        notif_by_camera[camera] = notif_by_camera.get(camera, 0) + 1
+        for lbl in (matched_labels or objects):
+            notif_by_label[lbl] = notif_by_label.get(lbl, 0) + 1
 
     remove_pending_event(review_id)
 
@@ -1786,6 +1801,60 @@ def mqtt_watchdog_loop():
 
 
 # ---------------------------------------------------------------------------
+# Daily summary digest
+# ---------------------------------------------------------------------------
+
+def send_daily_summary():
+    """Send a text-only digest of the last 24h of alerts to all providers."""
+    cutoff = time.time() - 86400
+    try:
+        with get_db() as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT camera, review_id FROM history WHERE timestamp > ? AND status = 'sent' AND review_id != 'summary' GROUP BY review_id",
+                (cutoff,),
+            ).fetchall()
+    except Exception as e:
+        log.error("Daily summary query error: %s", e)
+        return
+    total = len(rows)
+    by_camera = {}
+    for r in rows:
+        cam = r["camera"] or "unknown"
+        by_camera[cam] = by_camera.get(cam, 0) + 1
+    title = "Frigate Alerts - Daily Summary"
+    if total == 0:
+        message = "No alerts in the last 24 hours."
+    else:
+        ordered = sorted(by_camera.items(), key=lambda kv: kv[1], reverse=True)
+        breakdown = ", ".join(f"{cam}: {n}" for cam, n in ordered)
+        message = f"{total} alert{'s' if total != 1 else ''} in the last 24 hours\n{breakdown}"
+    log.info("Sending daily summary: %d alerts", total)
+    try:
+        send_to_all_providers(title, message, None, None, None,
+                              "", "", "summary", "", "", "", "", silent=True)
+    except Exception as e:
+        log.error("Daily summary send error: %s", e)
+
+
+def daily_summary_loop():
+    """Send a digest once per day at the configured local time (HH:MM)."""
+    global _last_summary_date
+    while not shutting_down.is_set():
+        cfg = config.get("daily_summary", {})
+        if cfg.get("enabled"):
+            now = datetime.now()
+            today = now.strftime("%Y-%m-%d")
+            if now.strftime("%H:%M") == cfg.get("time", "09:00") and _last_summary_date != today:
+                _last_summary_date = today
+                send_daily_summary()
+        for _ in range(30):
+            if shutting_down.is_set():
+                return
+            time.sleep(1)
+
+
+# ---------------------------------------------------------------------------
 # Event video page HTML
 # ---------------------------------------------------------------------------
 
@@ -1914,6 +1983,9 @@ async def lifespan(app: FastAPI):
 
     # Start cleanup loop
     threading.Thread(target=run_cleanup_loop, daemon=True).start()
+
+    # Start daily summary loop
+    threading.Thread(target=daily_summary_loop, daemon=True).start()
 
     log.info("Frigate Alerts v2.7 started (MQTT=%s, poll=%ds, event_pool=%d, provider_pool=%d)",
              "enabled" if mqtt_conf.get("enabled") and mqtt_conf.get("server") else "disabled",
@@ -2243,6 +2315,9 @@ async def metrics():
     mqtt_enabled = bool(mqtt_conf.get("enabled") and mqtt_conf.get("server"))
     with _phase2_lock:
         pending = len(pending_phase2)
+    with _stats_lock:
+        by_camera = dict(notif_by_camera)
+        by_label = dict(notif_by_label)
 
     lines = []
 
@@ -2250,6 +2325,13 @@ async def metrics():
         lines.append(f"# HELP {name} {help_text}")
         lines.append(f"# TYPE {name} {mtype}")
         lines.append(f"{name} {value}")
+
+    def m_labeled(name, mtype, help_text, series):
+        lines.append(f"# HELP {name} {help_text}")
+        lines.append(f"# TYPE {name} {mtype}")
+        for label_name, items in series.items():
+            for key, value in sorted(items.items()):
+                lines.append(f'{name}{{{label_name}="{_prom_escape(key)}"}} {value}')
 
     m("frigate_alerts_events_received_total", s.get("events_received", 0), "counter", "Alert events received")
     m("frigate_alerts_events_skipped_total", s.get("events_skipped", 0), "counter", "Events skipped by filters/snooze/quiet-hours")
@@ -2262,6 +2344,12 @@ async def metrics():
     m("frigate_alerts_pending_phase2", pending, "gauge", "Events awaiting a Phase 2 GIF upgrade")
     m("frigate_alerts_snoozed", int(is_snoozed()), "gauge", "Notifications currently snoozed (1) or not (0)")
     m("frigate_alerts_uptime_seconds", int(time.time() - _start_time), "gauge", "Seconds since process start")
+    if by_camera:
+        m_labeled("frigate_alerts_camera_notifications_total", "counter",
+                  "Phase 1 notifications sent, by camera", {"camera": by_camera})
+    if by_label:
+        m_labeled("frigate_alerts_label_notifications_total", "counter",
+                  "Phase 1 notifications sent, by label", {"label": by_label})
 
     return PlainTextResponse("\n".join(lines) + "\n", media_type="text/plain; version=0.0.4; charset=utf-8")
 
