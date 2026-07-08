@@ -226,10 +226,10 @@ def _validate_config():
         log.warning("Config: frigate.url not set, using default http://frigate:5000")
     cameras = config.get("cameras", [])
     if not cameras:
-        log.warning("Config: no cameras configured — will process ALL cameras")
+        log.warning("Config: no cameras configured - will process ALL cameras")
     labels = config.get("labels", [])
     if not labels:
-        log.warning("Config: no labels configured — will process ALL labels")
+        log.warning("Config: no labels configured - will process ALL labels")
     if not isinstance(cameras, list):
         log.error("Config: 'cameras' should be a list, got %s", type(cameras).__name__)
         config["cameras"] = []
@@ -238,7 +238,7 @@ def _validate_config():
         config["labels"] = []
     zones = config.get("zones", {})
     if not isinstance(zones, dict):
-        log.error("Config: 'zones' should be a dict, got %s — resetting", type(zones).__name__)
+        log.error("Config: 'zones' should be a dict, got %s - resetting", type(zones).__name__)
         config["zones"] = {}
 
 
@@ -406,11 +406,11 @@ def increment_pending_retry(review_id, attempts):
         log.error("Increment retry error: %s", e)
 
 
-# Phase 2 persistence — survives container restarts
+# Phase 2 persistence - survives container restarts
 def save_phase2_context(review_id, ctx):
     """Persist Phase 2 context to SQLite so GIF upgrades survive restarts."""
     try:
-        # msg_refs contains config dicts with tokens — only persist what we need
+        # msg_refs contains config dicts with tokens - only persist what we need
         serializable_ctx = {
             "title": ctx["title"],
             "message": ctx["message"],
@@ -510,7 +510,7 @@ def save_recent_review(review_id):
             )
             conn.commit()
     except Exception:
-        pass  # Non-critical — in-memory dedup is primary
+        pass  # Non-critical - in-memory dedup is primary
 
 
 def load_recent_reviews():
@@ -744,7 +744,7 @@ def build_message(camera, label_str, zone_str, review_id, event_id, face_names=N
 # Media fetching (with circuit breaker)
 # ---------------------------------------------------------------------------
 
-# Max clip size to process (50MB) — prevents ffmpeg from consuming excessive memory
+# Max clip size to process (50MB) - prevents ffmpeg from consuming excessive memory
 MAX_CLIP_SIZE = 50 * 1024 * 1024
 
 def clip_to_gif(clip_data, max_duration=3, fps=8, width=320):
@@ -855,7 +855,7 @@ def fetch_gif(event_id, retries=None, retry_interval=None):
                 if gif_data:
                     return gif_data, "image/gif", "gif"
             elif resp.status_code == 200:
-                # Clip exists but too small (not ready yet) — NOT a Frigate failure
+                # Clip exists but too small (not ready yet) - NOT a Frigate failure
                 _frigate_success()
             else:
                 _frigate_failure()
@@ -1256,7 +1256,7 @@ def process_phase1(review):
             notified_reviews.pop(review_id, None)
         return
 
-    # Set cooldown only once we're committed to notifying — otherwise a
+    # Set cooldown only once we're committed to notifying - otherwise a
     # snapshot-fetch failure would set the camera cooldown and then block its
     # own pending-event retry for the full cooldown window.
     set_cooldown(camera)
@@ -1544,7 +1544,7 @@ def stop_poller():
 
 
 # ---------------------------------------------------------------------------
-# Mode 2: MQTT (primary, instant notifications) — QoS 1 for guaranteed delivery
+# Mode 2: MQTT (primary, instant notifications) - QoS 1 for guaranteed delivery
 # ---------------------------------------------------------------------------
 
 def on_connect(client, userdata, flags, rc, properties=None):
@@ -1573,7 +1573,7 @@ def _safe_submit(pool, fn, *args):
     try:
         return pool.submit(fn, *args)
     except RuntimeError:
-        # Pool is shut down — discard silently
+        # Pool is shut down - discard silently
         return None
 
 
@@ -1676,7 +1676,7 @@ def mqtt_watchdog_loop():
             continue
 
         if _mqtt_last_message_time == 0:
-            # Never received a message — set baseline so watchdog doesn't fire on idle systems
+            # Never received a message - set baseline so watchdog doesn't fire on idle systems
             _mqtt_last_message_time = time.time()
             continue
 
@@ -1789,7 +1789,7 @@ async def lifespan(app: FastAPI):
         else:
             log.warning("Startup: Frigate returned %d (may not be ready yet)", r.status_code)
     except Exception as e:
-        log.warning("Startup: Frigate not reachable at %s (%s) — poller will retry", frigate_url, e)
+        log.warning("Startup: Frigate not reachable at %s (%s) - poller will retry", frigate_url, e)
 
     # Start MQTT (primary)
     mqtt_conf = config.get("mqtt", {})
@@ -1886,7 +1886,7 @@ def _unmask_secrets(new_obj, orig_obj, _sensitive=_SENSITIVE_KEYS):
     Restoration is by masked-VALUE identity, NOT list position: a lookup of
     {masked_form -> real_value} is built from the live config. This prevents
     secret swap/corruption when the UI reorders or deletes masked list items
-    (e.g. Pushover recipients, Discord webhooks) — the previous index-based
+    (e.g. Pushover recipients, Discord webhooks) - the previous index-based
     matching would restore a neighbour's secret onto the wrong entry. Any value
     the user actually changed won't match a masked form and is kept as typed.
     """
@@ -2074,7 +2074,7 @@ async def test_notification():
 
 @app.get("/api/health")
 async def health():
-    """Health check — verifies core subsystems are alive."""
+    """Health check - verifies core subsystems are alive."""
     healthy = True
     details = {}
 

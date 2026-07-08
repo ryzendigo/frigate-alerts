@@ -8,8 +8,8 @@ from datetime import datetime, timezone
 log = logging.getLogger("frigate-alerts")
 
 # Embed colors
-COLOR_ALERT = 0xEF4444    # Red — Phase 1 (new detection)
-COLOR_UPDATED = 0x22C55E  # Green — Phase 2 (GIF upgrade, event resolved)
+COLOR_ALERT = 0xEF4444    # Red - Phase 1 (new detection)
+COLOR_UPDATED = 0x22C55E  # Green - Phase 2 (GIF upgrade, event resolved)
 
 # Branded webhook identity
 WEBHOOK_USERNAME = "Frigate Alerts"
@@ -25,7 +25,7 @@ def _build_embed(title, message, camera, label, zone, url, video_url, ext, is_up
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "fields": [],
         "footer": {
-            "text": "Frigate Alerts" + (" • Updated with clip" if is_update else ""),
+            "text": "Frigate Alerts" + (" - Updated with clip" if is_update else ""),
         },
     }
 
