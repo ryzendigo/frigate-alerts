@@ -56,6 +56,18 @@ logging.basicConfig(
 )
 log = logging.getLogger("frigate-alerts")
 
+
+class _HealthPollFilter(logging.Filter):
+    """Drop uvicorn access logs for the high-frequency health/status polls
+    (Docker healthcheck every 30s, UI status poll every 10s) so they don't
+    bury the real application logs. Config/test/event/snooze requests are kept."""
+    def filter(self, record):
+        msg = record.getMessage()
+        return "/api/health" not in msg and "/api/status" not in msg
+
+
+logging.getLogger("uvicorn.access").addFilter(_HealthPollFilter())
+
 CONFIG_PATH = os.environ.get("CONFIG_PATH", "/app/config/config.yml")
 DB_PATH = os.environ.get("DB_PATH", "/app/config/alerts.db")
 
