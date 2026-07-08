@@ -1559,23 +1559,27 @@ def stop_poller():
 # Mode 2: MQTT (primary, instant notifications) - QoS 1 for guaranteed delivery
 # ---------------------------------------------------------------------------
 
-def on_connect(client, userdata, flags, rc, properties=None):
+def on_connect(client, userdata, flags, reason_code, properties=None):
     global mqtt_connected
-    if rc == 0:
+    if reason_code == 0:
         topic = f"{config.get('mqtt', {}).get('topic_prefix', 'frigate')}/reviews"
         client.subscribe(topic, qos=1)  # QoS 1: at-least-once delivery
         mqtt_connected = True
         log.info("MQTT connected, subscribed to %s (QoS 1)", topic)
     else:
         mqtt_connected = False
-        log.error("MQTT connection failed, rc=%d", rc)
+        # reason_code is a paho ReasonCode object, not an int - use %s
+        log.error("MQTT connection failed: %s", reason_code)
 
 
-def on_disconnect(client, userdata, rc, *args):
+def on_disconnect(client, userdata, disconnect_flags, reason_code, properties=None):
+    # paho v2 VERSION2 signature: the reason code is the 4th arg, not the 3rd.
+    # The old (client, userdata, rc, *args) form bound rc to disconnect_flags,
+    # so it logged "unexpectedly" on every disconnect and never showed the reason.
     global mqtt_connected
     mqtt_connected = False
-    if rc != 0:
-        log.warning("MQTT disconnected unexpectedly (rc=%d), will reconnect", rc)
+    if reason_code != 0:
+        log.warning("MQTT disconnected unexpectedly (reason=%s), will reconnect", reason_code)
 
 
 def _safe_submit(pool, fn, *args):
