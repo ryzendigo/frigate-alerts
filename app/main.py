@@ -38,7 +38,7 @@ import requests
 import uvicorn
 import yaml
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
 from .notifiers.pushover import send_pushover
@@ -59,11 +59,11 @@ log = logging.getLogger("frigate-alerts")
 
 class _HealthPollFilter(logging.Filter):
     """Drop uvicorn access logs for the high-frequency health/status polls
-    (Docker healthcheck every 30s, UI status poll every 10s) so they don't
-    bury the real application logs. Config/test/event/snooze requests are kept."""
+    (Docker healthcheck every 30s, UI status poll every 10s, Prometheus scrape)
+    so they don't bury the real application logs. Config/test/event/snooze kept."""
     def filter(self, record):
         msg = record.getMessage()
-        return "/api/health" not in msg and "/api/status" not in msg
+        return not any(p in msg for p in ("/api/health", "/api/status", "/metrics"))
 
 
 logging.getLogger("uvicorn.access").addFilter(_HealthPollFilter())
@@ -2128,6 +2128,41 @@ async def health():
 
     status_code = 200 if healthy else 503
     return JSONResponse({"status": "ok" if healthy else "unhealthy", **details}, status_code=status_code)
+
+
+@app.get("/metrics")
+async def metrics():
+    """Prometheus metrics for Grafana dashboards / alerting. Counters reset on
+    restart, which Prometheus handles natively via rate()."""
+    with _stats_lock:
+        s = dict(stats)
+    with _frigate_cb_lock:
+        cb_open = _frigate_circuit_open_until > time.time()
+    mqtt_conf = config.get("mqtt", {})
+    mqtt_enabled = bool(mqtt_conf.get("enabled") and mqtt_conf.get("server"))
+    with _phase2_lock:
+        pending = len(pending_phase2)
+
+    lines = []
+
+    def m(name, value, mtype, help_text):
+        lines.append(f"# HELP {name} {help_text}")
+        lines.append(f"# TYPE {name} {mtype}")
+        lines.append(f"{name} {value}")
+
+    m("frigate_alerts_events_received_total", s.get("events_received", 0), "counter", "Alert events received")
+    m("frigate_alerts_events_skipped_total", s.get("events_skipped", 0), "counter", "Events skipped by filters/snooze/quiet-hours")
+    m("frigate_alerts_phase1_sent_total", s.get("phase1_sent", 0), "counter", "Phase 1 snapshot notifications sent")
+    m("frigate_alerts_phase2_sent_total", s.get("phase2_sent", 0), "counter", "Phase 2 GIF upgrades sent")
+    m("frigate_alerts_errors_total", s.get("errors", 0), "counter", "Errors encountered")
+    m("frigate_alerts_mqtt_connected", int(bool(mqtt_connected)) if mqtt_enabled else 0, "gauge", "MQTT connected (1) or not (0)")
+    m("frigate_alerts_poller_running", int(bool(poller_running)), "gauge", "API poller running (1) or not (0)")
+    m("frigate_alerts_frigate_circuit_breaker_open", int(cb_open), "gauge", "Frigate API circuit breaker open (1) or closed (0)")
+    m("frigate_alerts_pending_phase2", pending, "gauge", "Events awaiting a Phase 2 GIF upgrade")
+    m("frigate_alerts_snoozed", int(is_snoozed()), "gauge", "Notifications currently snoozed (1) or not (0)")
+    m("frigate_alerts_uptime_seconds", int(time.time() - _start_time), "gauge", "Seconds since process start")
+
+    return PlainTextResponse("\n".join(lines) + "\n", media_type="text/plain; version=0.0.4; charset=utf-8")
 
 
 if __name__ == "__main__":

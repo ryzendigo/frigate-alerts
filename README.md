@@ -222,6 +222,7 @@ Default message: `Person detected on front_door (driveway)`
 | `/api/snooze/cancel` | POST | Cancel active snooze |
 | `/api/snooze/quick` | GET | Quick snooze via URL (`?minutes=30`) |
 | `/api/health` | GET | Health check endpoint |
+| `/metrics` | GET | Prometheus metrics (counters and gauges) for Grafana/alerting |
 
 ## Requirements
 
