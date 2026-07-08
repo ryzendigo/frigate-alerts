@@ -3,6 +3,8 @@ services:
     container_name: frigate-alerts
     build: .
     restart: unless-stopped
+    environment:
+      - TZ=${TZ:-UTC}
     ports:
       - "8085:8000"
     volumes:

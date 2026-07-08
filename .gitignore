@@ -8,3 +8,4 @@ dist/
 
 # Don't commit actual config with credentials - only the example
 config/config.yml
+config/*.bak

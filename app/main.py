@@ -1,5 +1,5 @@
 """
-Frigate Alerts - Main Application (v2.6 - Deep hardening & polish)
+Frigate Alerts - Main Application (v2.7 - Sound burst suppression + Phase 2 face recognition)
 Animated GIF notifications from Frigate NVR events.
 Supports: Pushover, Discord, Telegram, Ntfy, Gotify, Email, Webhook
 
@@ -63,6 +63,9 @@ config = {}
 mqtt_client = None
 mqtt_connected = False
 poller_running = False
+# Generation counter: invalidates stale poller threads on restart so a config
+# reload (stop_poller + start_poller) can't leak the previous poller thread.
+_poller_generation = 0
 shutting_down = threading.Event()
 
 # Thread-safe dedup using OrderedDict for recency-based trimming
@@ -1240,8 +1243,6 @@ def process_phase1(review):
 
     log.info("Phase 1: Review %s camera=%s objects=%s zones=%s", review_id, camera, matched_labels, zones)
 
-    set_cooldown(camera)
-
     event_id = detections[0]
     zone_str = ", ".join(zones) if zones else ""
     title, message = build_message(camera, label_str, zone_str, review_id, event_id)
@@ -1254,6 +1255,11 @@ def process_phase1(review):
         with _dedup_lock:
             notified_reviews.pop(review_id, None)
         return
+
+    # Set cooldown only once we're committed to notifying — otherwise a
+    # snapshot-fetch failure would set the camera cooldown and then block its
+    # own pending-event retry for the full cooldown window.
+    set_cooldown(camera)
 
     silent = not _should_play_sound()
     if silent:
@@ -1438,7 +1444,7 @@ def pending_retry_loop():
 # Mode 1: API Polling (fallback, catches anything MQTT misses)
 # ---------------------------------------------------------------------------
 
-def poll_frigate():
+def poll_frigate(generation):
     global poller_running, _last_poll_error, _poll_error_count
     poller_running = True
     frigate_url = config.get("frigate", {}).get("url", "http://frigate:5000")
@@ -1454,11 +1460,11 @@ def poll_frigate():
             return
         time.sleep(1)
 
-    while poller_running and not shutting_down.is_set():
+    while poller_running and not shutting_down.is_set() and generation == _poller_generation:
         # Circuit breaker: skip poll if Frigate is known down
         if not _frigate_circuit_ok():
             for _ in range(poll_interval):
-                if not poller_running or shutting_down.is_set():
+                if not poller_running or shutting_down.is_set() or generation != _poller_generation:
                     return
                 time.sleep(1)
             continue
@@ -1502,7 +1508,7 @@ def poll_frigate():
             _handle_poll_error(str(e))
 
         for _ in range(poll_interval):
-            if not poller_running or shutting_down.is_set():
+            if not poller_running or shutting_down.is_set() or generation != _poller_generation:
                 return
             time.sleep(1)
 
@@ -1521,14 +1527,20 @@ def _handle_poll_error(error_msg):
 
 
 def start_poller():
-    thread = threading.Thread(target=poll_frigate, daemon=True)
+    global _poller_generation
+    _poller_generation += 1
+    generation = _poller_generation
+    thread = threading.Thread(target=poll_frigate, args=(generation,), daemon=True)
     thread.start()
     return thread
 
 
 def stop_poller():
-    global poller_running
+    global poller_running, _poller_generation
     poller_running = False
+    # Bump generation so any still-running poller thread exits even if a new
+    # poller is started before it observes poller_running=False.
+    _poller_generation += 1
 
 
 # ---------------------------------------------------------------------------
@@ -1719,10 +1731,10 @@ def build_event_page(event_id):
     except Exception:
         return None
 
-    camera = html.escape(event.get("camera", "unknown"))
-    label = html.escape(event.get("label", "unknown").title())
-    start = datetime.fromtimestamp(event.get("start_time", 0)).strftime("%Y-%m-%d %H:%M:%S")
-    zones = html.escape(", ".join(event.get("zones", [])) or "none")
+    camera = html.escape(str(event.get("camera") or "unknown"))
+    label = html.escape(str(event.get("label") or "unknown").title())
+    start = datetime.fromtimestamp(event.get("start_time") or 0).strftime("%Y-%m-%d %H:%M:%S")
+    zones = html.escape(", ".join(event.get("zones") or []) or "none")
     event_id = html.escape(str(event_id))
     media_base = frigate_public or frigate_url
     clip_url = f"{media_base}/api/events/{event_id}/clip.mp4"
@@ -1803,7 +1815,7 @@ async def lifespan(app: FastAPI):
     # Start cleanup loop
     threading.Thread(target=run_cleanup_loop, daemon=True).start()
 
-    log.info("Frigate Alerts v2.6 started (MQTT=%s, poll=%ds, event_pool=%d, provider_pool=%d)",
+    log.info("Frigate Alerts v2.7 started (MQTT=%s, poll=%ds, event_pool=%d, provider_pool=%d)",
              "enabled" if mqtt_conf.get("enabled") and mqtt_conf.get("server") else "disabled",
              config.get("poll_interval", 5),
              event_pool._max_workers,
@@ -1836,54 +1848,74 @@ async def event_page(event_id: str):
     return HTMLResponse("<h1>Event not found</h1>", status_code=404)
 
 
-def _mask_secrets(obj, _sensitive={"token", "password", "secret", "api_key", "apikey", "userkey", "webhook"}):
+_SENSITIVE_KEYS = {"token", "password", "secret", "api_key", "apikey", "userkey", "webhook"}
+
+
+def _mask_one(key, value, _sensitive=_SENSITIVE_KEYS):
+    """Return the masked form of a single (key, value) pair, or None if the
+    value is not a sensitive string that should be masked."""
+    if not isinstance(value, str):
+        return None
+    if any(s in key.lower() for s in _sensitive) and len(value) > 4:
+        return value[:4] + "****"
+    if key == "url" and ("webhook" in value.lower() or "hooks" in value.lower()):
+        return value[:30] + "****" if len(value) > 30 else "****"
+    return None
+
+
+def _mask_secrets(obj, _sensitive=_SENSITIVE_KEYS):
     """Recursively mask sensitive config values for safe API exposure."""
     if isinstance(obj, dict):
         masked = {}
         for k, v in obj.items():
-            if any(s in k.lower() for s in _sensitive) and isinstance(v, str) and len(v) > 4:
-                masked[k] = v[:4] + "****"
-            elif k == "url" and isinstance(v, str) and ("webhook" in v.lower() or "hooks" in v.lower()):
-                masked[k] = v[:30] + "****" if len(v) > 30 else "****"
-            else:
-                masked[k] = _mask_secrets(v)
+            m = _mask_one(k, v, _sensitive)
+            masked[k] = m if m is not None else _mask_secrets(v, _sensitive)
         return masked
     elif isinstance(obj, list):
-        return [_mask_secrets(i) for i in obj]
+        return [_mask_secrets(i, _sensitive) for i in obj]
     return obj
 
 
-def _unmask_secrets(new_obj, orig_obj, _sensitive={"token", "password", "secret", "api_key", "apikey", "userkey", "webhook"}):
-    """Restore masked values (ending in ****) from the live config before saving.
+def _unmask_secrets(new_obj, orig_obj, _sensitive=_SENSITIVE_KEYS):
+    """Restore masked placeholders (ending in ****) from the live config.
 
     When the web UI fetches config via GET /api/config, sensitive fields are
-    masked (e.g. "abcd****").  If the user saves the config back without
-    editing those fields, the masked placeholders would overwrite the real
-    secrets on disk.  This function detects masked values and restores them
-    from the currently-loaded (unmasked) config.
+    masked (e.g. "abcd****"). On save the UI sends those placeholders back; if
+    left untouched they must be restored to the real secret before writing.
+
+    Restoration is by masked-VALUE identity, NOT list position: a lookup of
+    {masked_form -> real_value} is built from the live config. This prevents
+    secret swap/corruption when the UI reorders or deletes masked list items
+    (e.g. Pushover recipients, Discord webhooks) — the previous index-based
+    matching would restore a neighbour's secret onto the wrong entry. Any value
+    the user actually changed won't match a masked form and is kept as typed.
     """
-    if isinstance(new_obj, dict) and isinstance(orig_obj, dict):
-        restored = {}
-        for k, v in new_obj.items():
-            orig_v = orig_obj.get(k)
-            is_sensitive_key = any(s in k.lower() for s in _sensitive)
-            is_webhook_url = k == "url" and isinstance(v, str) and ("webhook" in v.lower() or "hooks" in v.lower() or v.endswith("****"))
-            if (is_sensitive_key or is_webhook_url) and isinstance(v, str) and v.endswith("****") and isinstance(orig_v, str):
-                restored[k] = orig_v
-            elif orig_v is not None:
-                restored[k] = _unmask_secrets(v, orig_v, _sensitive)
-            else:
-                restored[k] = v
-        return restored
-    elif isinstance(new_obj, list) and isinstance(orig_obj, list):
-        result = []
-        for i, item in enumerate(new_obj):
-            if i < len(orig_obj):
-                result.append(_unmask_secrets(item, orig_obj[i], _sensitive))
-            else:
-                result.append(item)
-        return result
-    return new_obj
+    unmask_map = {}
+
+    def _collect(o):
+        if isinstance(o, dict):
+            for k, v in o.items():
+                m = _mask_one(k, v, _sensitive)
+                if m is not None and m != v:
+                    unmask_map.setdefault(m, v)
+                else:
+                    _collect(v)
+        elif isinstance(o, list):
+            for it in o:
+                _collect(it)
+
+    _collect(orig_obj)
+
+    def _restore(o):
+        if isinstance(o, dict):
+            return {k: _restore(v) for k, v in o.items()}
+        if isinstance(o, list):
+            return [_restore(i) for i in o]
+        if isinstance(o, str) and o.endswith("****") and o in unmask_map:
+            return unmask_map[o]
+        return o
+
+    return _restore(new_obj)
 
 @app.get("/api/config")
 async def get_config():
@@ -1955,8 +1987,16 @@ async def status():
 @app.post("/api/snooze")
 async def snooze(request: Request):
     global snooze_until
-    body = await request.json()
-    minutes = body.get("minutes", 30)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"status": "error", "message": "Invalid JSON"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"status": "error", "message": "Body must be a JSON object"}, status_code=400)
+    try:
+        minutes = int(body.get("minutes", 30))
+    except (TypeError, ValueError):
+        return JSONResponse({"status": "error", "message": "minutes must be a number"}, status_code=400)
     minutes = min(minutes, 1440)  # Cap at 24 hours
     if minutes <= 0:
         snooze_until = 0
