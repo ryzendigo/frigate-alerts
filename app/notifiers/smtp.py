@@ -2,6 +2,7 @@
 
 import logging
 import smtplib
+from email.header import Header
 from email.mime.image import MIMEImage
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -25,10 +26,10 @@ def send_smtp(config, title, message, image_data, image_type="image/gif", url=No
         body += f"\n\nView in Frigate: {url}"
 
     msg = MIMEMultipart()
-    msg["Subject"] = title
+    msg["Subject"] = Header(title, "utf-8")
     msg["From"] = sender
     msg["To"] = ", ".join(recipients)
-    msg.attach(MIMEText(body))
+    msg.attach(MIMEText(body, _charset="utf-8"))
 
     ext = "gif" if "gif" in image_type else "jpeg"
     subtype = ext

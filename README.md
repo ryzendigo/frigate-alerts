@@ -36,7 +36,7 @@ Frigate Alerts has two ways to detect events, and both can run at the same time:
 | **API Polling** (default) | ~10 seconds | Just Frigate URL | Zero config |
 | **MQTT** (optional) | Instant | MQTT broker details | Add broker in settings |
 
-**By default, only API polling is used.** It queries Frigate's API every 10 seconds for new completed alerts. This means you don't need an MQTT broker, and it doesn't touch your Home Assistant or any other system.
+**By default, only API polling is used.** It queries Frigate's API every 5 seconds for new completed alerts. This means you don't need an MQTT broker, and it doesn't touch your Home Assistant or any other system.
 
 **If you add MQTT**, both modes run simultaneously. MQTT delivers instantly, and the API poller acts as an automatic fallback if MQTT ever disconnects. Events are deduplicated so you'll never get double notifications.
 

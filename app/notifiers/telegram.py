@@ -1,5 +1,6 @@
 """Telegram notification provider. Sends GIF, photo, or video via Bot API."""
 
+import html
 import logging
 import requests
 
@@ -13,12 +14,13 @@ def send_telegram(config, title, message, media_data, media_type="image/gif",
     if not token or not chat_id:
         return "error: missing token or chat_id"
 
-    text = f"*{title}*\n{message}"
+    # HTML parse mode with escaping - Markdown breaks on _ * [ ] in camera/label names
+    text = f"<b>{html.escape(title or '')}</b>\n{html.escape(message or '')}"
     links = []
     if url:
-        links.append(f"[View in Frigate]({url})")
+        links.append(f'<a href="{html.escape(url)}">View in Frigate</a>')
     if video_url:
-        links.append(f"[Watch Video]({video_url})")
+        links.append(f'<a href="{html.escape(video_url)}">Watch Video</a>')
     if links:
         text += "\n\n" + " | ".join(links)
 
@@ -28,21 +30,21 @@ def send_telegram(config, title, message, media_data, media_type="image/gif",
         if "video" in (media_type or ""):
             resp = requests.post(
                 f"{api_base}/sendVideo",
-                data={"chat_id": chat_id, "caption": text, "parse_mode": "Markdown"},
+                data={"chat_id": chat_id, "caption": text, "parse_mode": "HTML"},
                 files={"video": ("clip.mp4", media_data, media_type)},
                 timeout=60,
             )
         elif "gif" in (media_type or ""):
             resp = requests.post(
                 f"{api_base}/sendAnimation",
-                data={"chat_id": chat_id, "caption": text, "parse_mode": "Markdown"},
+                data={"chat_id": chat_id, "caption": text, "parse_mode": "HTML"},
                 files={"animation": ("preview.gif", media_data, media_type)},
                 timeout=30,
             )
         else:
             resp = requests.post(
                 f"{api_base}/sendPhoto",
-                data={"chat_id": chat_id, "caption": text, "parse_mode": "Markdown"},
+                data={"chat_id": chat_id, "caption": text, "parse_mode": "HTML"},
                 files={"photo": ("snapshot.jpg", media_data, media_type)},
                 timeout=30,
             )

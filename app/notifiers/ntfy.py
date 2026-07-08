@@ -16,14 +16,19 @@ def send_ntfy(config, title, message, image_data, image_type="image/gif", url=No
     ntfy_url = f"{server.rstrip('/')}/{topic}"
     ext = "gif" if "gif" in (image_type or "") else "jpg"
 
+    # Title/Message go in HTTP headers (body holds the binary image), so newlines
+    # must be stripped or they would corrupt the request / allow header injection.
+    def _hdr(v):
+        return str(v).replace("\r", " ").replace("\n", " ").strip()
+
     headers = {
-        "Title": title,
+        "Title": _hdr(title),
         "Filename": f"preview.{ext}",
     }
 
     # Include message text (sent via header when body is binary image data)
     if message:
-        headers["Message"] = message
+        headers["Message"] = _hdr(message)
 
     if url:
         headers["Click"] = url

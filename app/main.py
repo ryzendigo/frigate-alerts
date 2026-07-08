@@ -1315,8 +1315,8 @@ def process_phase2(review_id):
     event_id = ctx["event_id"]
     log.info("Phase 2: Fetching GIF for %s (event %s)", review_id, event_id)
 
-    # Small delay to let Frigate finalize the clip
-    time.sleep(2)
+    # Wait for Frigate to finalize the clip (configurable via gif_delay, clamped 0-30s)
+    time.sleep(min(max(config.get("gif_delay", 2), 0), 30))
 
     gif_data, gif_type, gif_ext = fetch_gif(event_id)
     if gif_data:
